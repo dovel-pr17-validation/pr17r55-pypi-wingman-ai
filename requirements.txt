@@ -111,7 +111,7 @@ cryptography>=43.0.1
 pdfminer.six>=20240706
 
 # --- control_windows skill ---
-clip-util>=0.1.27
+clip-util>=0.1.30
 
 # --- msfs2020_control skill ---
 SimConnect>=0.4.26

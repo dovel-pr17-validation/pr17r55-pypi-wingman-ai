@@ -1,0 +1,39 @@
+module: skills.spotify.main
+name: Spotify
+api_version: 3
+display_name: Spotify
+author: ShipBit
+tags:
+  - Music
+  - Internet
+description:
+  en: Control Spotify using the WebAPI. Play songs, artists, playlists. Control playback, volume, and more. All powered by AI!
+  de: Steuere Spotify mit der WebAPI. Spiele Lieder, Künstler und Playlists ab. Steuere die Wiedergabe, Lautstärke und mehr. Alles von KI gesteuert!
+discovery_keywords:
+  - music
+  - play song
+  - artist
+  - playlist
+  - pause
+  - skip
+  - volume
+  - next track
+  - previous
+  - shuffle
+discoverable_by_default: false
+hint:
+  en: <ul class="list-disc"><li>Create an app in the <a class="anchor" target="_blank" href="https://developer.spotify.com/dashboard">Spotify Dashboard</a>.</li><li>Select "Web API" and "Web Playback SDK" as APIs used.</li><li>Add the same Redirect URL as configured here.</li><li>Enter Client ID and Client secret here.</li><li>In the Spotify Dashboard, add your Spotify Email adress as user for the Spotify app (Tab 'User Management').</li><li>Authorize Wingman AI with Spotify in the browser.</li></ul>
+  de: <ul class="list-disc"><li>Erstelle eine App im <a class="anchor" target="_blank" href="https://developer.spotify.com/dashboard">Spotify Dashboard</a>.</li><li>Wähle "Web API" und "Web Playback SDK" als verwendete APIs.</li><li>Füge die gleiche Redirect URL wie hier hinzu.</li><li>Gib die Client ID and das Client Secret hier ein.</li><li>Füge deine Spotify E-Mail Adresse als Benutzer für die Spotify app hinzu (Tab 'User Management').</li><li>Gib der Wingman AI app Zugriff auf Spotify im Browser</li></ul>
+custom_properties:
+  - hint: Create an app in the Spotify Dashboard at https://developer.spotify.com/dashboard. You'll find the Client ID in the Settings of that app.
+    id: spotify_client_id
+    name: Spotify Client ID
+    required: true
+    value: enter-your-client-id-here
+    property_type: string
+  - hint: Create an app in the Spotify Dashboard at https://developer.spotify.com/dashboard. In the Settings of the app, add http://127.0.0.1:8082 (or any other free port) as Redirect URL. Then enter the same value here.
+    id: spotify_redirect_url
+    name: Spotify Redirect URL
+    required: true
+    value: http://127.0.0.1:8082
+    property_type: string

@@ -1,0 +1,410 @@
+"""Paths and helpers shared by more than one test module.
+
+Fixtures live in conftest.py. This module holds plain functions and constants,
+so test modules import them explicitly instead of from conftest.
+"""
+
+import importlib
+import os
+import queue
+import shutil
+from os import path
+from types import SimpleNamespace
+
+import requests
+import yaml
+
+from api.enums import DecisionModelProvider
+from hud_server.platform.base import HudBackend, Monitor
+from services.system_manager import LOCAL_VERSION
+
+REPO_ROOT = path.dirname(path.dirname(path.abspath(__file__)))
+TEMPLATES = path.join(REPO_ROOT, "templates", "configs")
+FIXTURES = path.join(REPO_ROOT, "tests", "fixtures")
+# The config folder name of the version under test, e.g. "3_2_5".
+VERSION_DIR = LOCAL_VERSION.replace(".", "_")
+
+
+def decision_model_settings(
+    enabled: bool = True,
+    provider: DecisionModelProvider = DecisionModelProvider.WINGMAN_PRO,
+    endpoint: str = "",
+    model: str = "",
+    openrouter_model: str = "~typesafe/jev-latest",
+    **switches,
+) -> SimpleNamespace:
+    """Settings with only what the decision model reads: its switches, its
+    provider, and where Wingman Pro lives."""
+    places = {"commands": True, "wingman_choice": True, "vocabulary": True, "skills": True}
+    places.update(switches)
+    return SimpleNamespace(
+        decision_model=SimpleNamespace(
+            enabled=enabled,
+            provider=provider,
+            openrouter=SimpleNamespace(model=openrouter_model),
+            server=SimpleNamespace(endpoint=endpoint, model=model),
+            **places,
+        ),
+        wingman_pro=SimpleNamespace(base_url="https://pro.invalid"),
+    )
+
+
+def with_secrets(client, **secrets):
+    """The client reads its keys from the secret store on every call; this
+    gives it a store of its own instead of the user's."""
+    client._secret_keeper = SimpleNamespace(secrets=secrets)
+    return client
+
+
+class FakeDecisionSession:
+    """Records what the client would have sent and answers with ``body``."""
+
+    def __init__(self, body=None, status_code=200):
+        self.body = body if body is not None else {"answers": {}}
+        self.status_code = status_code
+        self.requests = []
+        self.closed = False
+
+    def post(self, url, **kwargs):
+        self.requests.append((url, kwargs))
+        return SimpleNamespace(
+            ok=self.status_code < 400,
+            status_code=self.status_code,
+            text="provider error",
+            json=lambda: self.body,
+        )
+
+    def close(self):
+        self.closed = True
+
+
+def read_yaml(file_path: str):
+    with open(file_path, "r", encoding="UTF-8") as f:
+        return yaml.safe_load(f)
+
+
+def write_yaml(file_path: str, content) -> None:
+    with open(file_path, "w", encoding="UTF-8") as f:
+        yaml.safe_dump(content, f)
+
+
+def migration_modules() -> list:
+    """Every config migration module, imported."""
+    folder = path.join(REPO_ROOT, "services", "migrations")
+    return [
+        importlib.import_module(f"services.migrations.{name[:-3]}")
+        for name in sorted(os.listdir(folder))
+        if name.startswith("migration_") and name.endswith(".py")
+    ]
+
+
+def template(name: str):
+    """A file from templates/configs, parsed."""
+    return read_yaml(path.join(TEMPLATES, name))
+
+
+def config_names(users_dir: str, version_dir: str = VERSION_DIR) -> list[str]:
+    """The visible config folders of one version, sorted."""
+    configs = path.join(users_dir, version_dir, "configs")
+    return sorted(
+        d
+        for d in os.listdir(configs)
+        if path.isdir(path.join(configs, d)) and not d.startswith(".")
+    )
+
+
+# ── an older install on disk ───────────────────────────────────────────
+
+
+def make_old_version(users_dir: str, version_dir: str, config_dirs: dict) -> str:
+    """Create the config folder an older Wingman left behind.
+
+    `config_dirs` maps a folder name (legacy prefixes allowed) to its files:
+    filename -> YAML content, or None to copy the shipped template wingman.
+    settings.yaml and defaults.yaml are copied from the current templates.
+    """
+    old_configs = path.join(users_dir, version_dir, "configs")
+    os.makedirs(old_configs)
+
+    for filename in ("settings.yaml", "defaults.yaml"):
+        shutil.copyfile(path.join(TEMPLATES, filename), path.join(old_configs, filename))
+
+    # Every completed version has this marker. Without it the folder counts as
+    # an interrupted migration.
+    with open(path.join(old_configs, ".migration"), "w", encoding="UTF-8") as f:
+        f.write(f"Version {version_dir} - test fixture\n")
+
+    for dir_name, files in config_dirs.items():
+        dir_path = path.join(old_configs, dir_name)
+        os.makedirs(dir_path)
+        for filename, content in files.items():
+            file_path = path.join(dir_path, filename)
+            if content is None:
+                template_name = filename.lstrip(".").replace(".yaml", ".template.yaml")
+                template_dir = dir_name.lstrip("._") or dir_name
+                shutil.copyfile(path.join(TEMPLATES, template_dir, template_name), file_path)
+            else:
+                write_yaml(file_path, content)
+
+    return old_configs
+
+
+def migration_service(config_manager):
+    from services.config_migration_service import ConfigMigrationService
+    from services.system_manager import SystemManager
+
+    return ConfigMigrationService(config_manager=config_manager, system_manager=SystemManager())
+
+
+def boot_and_migrate(boot_config_manager):
+    """Start the way main.py does: ConfigManager first, then the migrations."""
+    config_manager = boot_config_manager()
+    service = migration_service(config_manager)
+    service.migrate_to_latest()
+    return config_manager, service
+
+
+# ── a ConfigManager over a plain folder ────────────────────────────────
+
+
+class FakeConfigManager:
+    """The few ConfigManager methods the voice and language helpers call,
+    over `root/configs/<config>/<wingman>.yaml`."""
+
+    def __init__(self, root):
+        self.config_dir = str(root / "configs")
+
+    def get_config_dirs(self):
+        return [
+            SimpleNamespace(name=d, directory=d)
+            for d in sorted(os.listdir(self.config_dir))
+            if path.isdir(path.join(self.config_dir, d))
+        ]
+
+    def get_wingmen_configs(self, config_dir):
+        folder = path.join(self.config_dir, config_dir.directory)
+        return [
+            SimpleNamespace(name=f[:-5], file=f)
+            for f in sorted(os.listdir(folder))
+            if f.endswith(".yaml")
+        ]
+
+    def read_config(self, file_path):
+        return read_yaml(file_path)
+
+    def write_config(self, file_path, content):
+        write_yaml(file_path, content)
+        return True
+
+
+# ── a HUD backend without an operating system ──────────────────────────
+
+
+class FakeHudBackend(HudBackend):
+    """The HUD's windows as plain records, so the overlay runs on any OS.
+    `present` keeps a copy of the image; `pointer()` plays the mouse."""
+
+    def __init__(self, monitors=None):
+        self.screens = [Monitor(0, 0, 1920, 1080, True)] if monitors is None else monitors
+        self.windows: list[SimpleNamespace] = []
+        self.cursor = (0, 0)
+        self.captured = None
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+        self.windows.clear()
+
+    def pump_events(self):
+        pass
+
+    def create_window(self, title, x, y, width, height):
+        window = SimpleNamespace(
+            title=title, rect=(x, y, width, height), shown=True, image=None,
+            opacity=0, click_through=True, handler=None, raised=0,
+        )
+        self.windows.append(window)
+        return window
+
+    def destroy_window(self, window):
+        if window in self.windows:
+            self.windows.remove(window)
+
+    def move_window(self, window, x, y, width, height):
+        window.rect = (x, y, width, height)
+
+    def raise_window(self, window):
+        window.raised += 1
+
+    def show_window(self, window):
+        window.shown = True
+
+    def hide_window(self, window):
+        window.shown = False
+
+    def present(self, window, image, opacity):
+        window.image = image.copy()
+        window.opacity = opacity
+
+    def set_click_through(self, window, click_through):
+        window.click_through = click_through
+
+    def set_pointer_handler(self, window, handler):
+        window.handler = handler
+
+    def capture_pointer(self, window):
+        self.captured = window
+
+    def release_pointer(self):
+        self.captured = None
+
+    def cursor_position(self):
+        return self.cursor
+
+    def monitors(self):
+        return list(self.screens)
+
+    def window(self, title: str):
+        return next(w for w in self.windows if w.title == title)
+
+    def pointer(self, window, event, x, y):
+        """The mouse did `event` at screen (x, y) over `window`."""
+        self.cursor = (x, y)
+        return window.handler(event, x, y) if window.handler else None
+
+
+HUD_HOST = "127.0.0.1:7862"
+
+
+class FakeObs:
+    """Stands in for the OBS broadcaster: what the overlay says is on screen."""
+
+    def __init__(self):
+        self.shown = {}  # window name -> (canvas, x, y, opacity)
+
+    def set_dimensions(self, width, height):
+        pass
+
+    def set_framerate(self, framerate):
+        pass
+
+    def set_container(self, name, x, y, width, height):
+        pass
+
+    def show_window(self, name, canvas, x, y, opacity):
+        self.shown[name] = (canvas, x, y, opacity)
+
+    def move_window(self, name, x, y, opacity):
+        self.shown[name] = (self.shown[name][0], x, y, opacity)
+
+    def hide_window(self, name):
+        self.shown.pop(name, None)
+
+
+def hud_client(server):
+    """A test client for the HUD server, reached on 127.0.0.1 as the /obs page is."""
+    from fastapi.testclient import TestClient
+
+    return TestClient(server.app, headers={"host": HUD_HOST})
+
+
+def hold_encoding(monkeypatch, size):
+    """Make the OBS encoder stop on pictures of `size` until released.
+    Returns (started, release): events for "it is encoding now" and "go on"."""
+    import threading
+
+    from hud_server import obs
+
+    started, release = threading.Event(), threading.Event()
+    encode = obs._png
+
+    def held(image):
+        if image.size == size:
+            started.set()
+            release.wait(5)
+        return encode(image)
+
+    monkeypatch.setattr(obs, "_png", held)
+    return started, release
+
+
+def make_overlay(backend, events=None, obs_broadcaster=None):
+    """A HUD overlay on `backend`, fonts loaded, ready to step frames by hand."""
+    from hud_server.overlay.overlay import HeadsUpOverlay
+
+    overlay = HeadsUpOverlay(
+        command_queue=queue.Queue(),
+        error_queue=queue.Queue(),
+        event_callback=(events.append if events is not None else None),
+        backend=backend,
+        obs_broadcaster=obs_broadcaster,
+    )
+    overlay._init_fonts()
+    overlay.dt = 0.05
+    return overlay
+
+
+def run_frames(overlay, count=10):
+    for _ in range(count):
+        overlay._update_all_windows()
+
+
+def bottom_edge(backend, overlay, window: str) -> tuple:
+    """The pixel in the middle of a HUD window's bottom edge, where the
+    loader glows. `window` is the overlay's name for it, as "message_atc"."""
+    from hud_server.rendering.glass import SHADOW
+
+    image = backend.window(f"HUD_{window}").image
+    width = image.width - SHADOW.left - SHADOW.right
+    return image.getpixel((SHADOW.left + width // 2, SHADOW.top + overlay._windows[window]["body_height"] - 1))
+
+
+def overlay_errors(overlay) -> list:
+    """The errors the overlay reported so far (heartbeats left out)."""
+    reports = []
+    while not overlay.error_queue.empty():
+        report = overlay.error_queue.get()
+        if isinstance(report, dict) and report.get("type") == "error":
+            reports.append(report)
+    return reports
+
+
+# A model download over a connection that breaks
+
+BODY = bytes(range(256)) * 40  # 10,240 bytes
+
+
+class FlakyServer:
+    """Serves BODY, honours Range, and breaks the connection after `cut`
+    bytes for the first `breaks` requests."""
+
+    def __init__(self, cut: int, breaks: int):
+        self.cut = cut
+        self.breaks = breaks
+        self.ranges: list[str | None] = []
+
+    def get(self, url, stream=True, timeout=None, headers=None):
+        start = 0
+        rng = (headers or {}).get("Range")
+        self.ranges.append(rng)
+        if rng:
+            start = int(rng.split("=")[1].rstrip("-"))
+        body = BODY[start:]
+        broken = self.breaks > 0
+        self.breaks -= 1
+
+        def iter_content(chunk_size):
+            if broken:
+                yield body[: self.cut]
+                raise requests.exceptions.ChunkedEncodingError("Connection broken")
+            yield body
+
+        return SimpleNamespace(
+            status_code=206 if start else 200,
+            headers={"content-length": str(len(body))},
+            raise_for_status=lambda: None,
+            iter_content=iter_content,
+        )

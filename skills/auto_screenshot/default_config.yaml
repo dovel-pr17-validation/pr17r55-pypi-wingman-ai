@@ -1,0 +1,32 @@
+module: skills.auto_screenshot.main
+name: AutoScreenshot
+api_version: 3
+display_name: Auto Screenshot
+author: teddybear082
+discoverable_by_default: false
+tags:
+  - Utility
+  - Game
+description:
+  en: Take screenshots on command or automatically when you show excitement.
+  de: Mache Screenshots auf Befehl oder automatisch wenn du Aufregung zeigst.
+discovery_keywords:
+  - screenshot
+  - capture screen
+  - take picture
+  - screen capture
+  - save image
+  - automatic screenshot
+custom_properties:
+  - hint: If you have multiple monitors, the display to capture if detecting the active game window fails
+    id: display
+    name: Display to capture
+    property_type: number
+    required: true
+    value: 1
+  - hint: Defaults to your WingmanAI APPDATA directory in a subdirectory called "generated_files" if left blank.
+    id: default_directory
+    name: Default directory
+    property_type: directory
+    required: false
+    value: ""

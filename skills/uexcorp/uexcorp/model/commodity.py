@@ -1,0 +1,428 @@
+from datetime import datetime
+from skills.uexcorp.uexcorp.model.data_model import DataModel
+
+class Commodity(DataModel):
+
+    required_keys = ["id"]
+
+    def __init__(
+            self,
+            id: int, # int(11)
+            id_parent: int|None = None, # int(11)
+            name: str|None = None, # string(255)
+            code: str|None = None, # string(5)
+            slug: str|None = None, # string(255)
+            kind: str|None = None, # string(255)
+            weight_scu: int|None = None, # int(11)
+            price_buy: float|None = None, # float
+            price_sell: float|None = None, # float
+            is_available: int|None = None, # int(1)
+            is_available_live: int|None = None, # int(1)
+            is_visible: int|None = None, # int(1)
+            is_raw: int|None = None, # int(1)
+            is_refined: int|None = None, # int(1)
+            is_mineral: int|None = None, # int(1)
+            is_harvestable: int|None = None, # int(1)
+            is_buyable: int|None = None, # int(1)
+            is_sellable: int|None = None, # int(1)
+            is_temporary: int|None = None, # int(1)
+            is_illegal: int|None = None, # int(1)
+            is_fuel: int|None = None, # int(1)
+            wiki: str|None = None, # string(255)
+            date_added: int|None = None, # int(11)
+            date_modified: int|None = None, # int(11)
+
+            is_blacklisted: int|None = None, # int(1) # own property
+            id_item: int|None = None, # int(11)
+            ids_star_systems: str|None = None, # string(255)
+            ids_planets: str|None = None, # string(255)
+            ids_moons: str|None = None, # string(255)
+            ids_poi: str|None = None, # string(255)
+            ids_orbits: str|None = None, # string(255)
+            uuid: str|None = None, # string(255)
+            is_extractable: int|None = None, # int(1)
+            is_pure: int|None = None, # int(1)
+            is_refinable: int|None = None, # int(1)
+            is_volatile_qt: int|None = None, # int(1)
+            is_volatile_time: int|None = None, # int(1)
+            is_inert: int|None = None, # int(1)
+            is_explosive: int|None = None, # int(1)
+            is_buggy: int|None = None, # int(1)
+            load: bool = False,
+    ):
+        super().__init__("commodity")
+        self.data = {
+            "id": id,
+            "id_parent": id_parent,
+            "name": name,
+            "code": code,
+            "slug": slug,
+            "kind": kind,
+            "weight_scu": weight_scu,
+            "price_buy": price_buy,
+            "price_sell": price_sell,
+            "is_available": is_available,
+            "is_available_live": is_available_live,
+            "is_visible": is_visible,
+            "is_raw": is_raw,
+            "is_refined": is_refined,
+            "is_mineral": is_mineral,
+            "is_harvestable": is_harvestable,
+            "is_buyable": is_buyable,
+            "is_sellable": is_sellable,
+            "is_temporary": is_temporary,
+            "is_illegal": is_illegal,
+            "is_fuel": is_fuel,
+            "wiki": wiki,
+            "date_added": date_added,
+            "date_modified": date_modified,
+            "is_blacklisted": is_blacklisted,
+            "id_item": id_item,
+            "ids_star_systems": ids_star_systems,
+            "ids_planets": ids_planets,
+            "ids_moons": ids_moons,
+            "ids_poi": ids_poi,
+            "ids_orbits": ids_orbits,
+            "uuid": uuid,
+            "is_extractable": is_extractable,
+            "is_pure": is_pure,
+            "is_refinable": is_refinable,
+            "is_volatile_qt": is_volatile_qt,
+            "is_volatile_time": is_volatile_time,
+            "is_inert": is_inert,
+            "is_explosive": is_explosive,
+            "is_buggy": is_buggy,
+            "last_import_run_id": None,
+        }
+        if load:
+            if not self.data["id"]:
+                raise Exception("ID is required to load data")
+            self.load_by_value("id", self.data["id"])
+
+        self.profit_calculated = False
+        self.profit_min = None
+        self.profit_max = None
+        self.profit_margin_min = None
+        self.profit_margin_max = None
+        self.base_profit_min = None
+        self.base_profit_max = None
+
+    def get_properties(self) -> list[str]:
+        properties = []
+
+        if self.get_is_raw():
+            properties.append("raw")
+        if self.get_is_refined():
+            properties.append("refined")
+        if self.get_is_mineral():
+            properties.append("mineral")
+        if self.get_is_harvestable():
+            properties.append("harvestable")
+        if self.get_is_temporary():
+            properties.append("temporary")
+        if self.get_is_illegal():
+            properties.append("illegal")
+        else:
+            properties.append("legal")
+        if self.get_is_fuel():
+            properties.append("fuel")
+        properties.extend(self.get_hazards())
+        if self.get_is_blacklisted():
+            properties.append("Blacklisted for trade recommendations through advanced uex skill configuration")
+
+        return properties
+
+    def get_hazards(self) -> list[str]:
+        # Cargo risks worth warning about wherever the commodity is traded.
+        hazards = []
+
+        if self.get_is_volatile_qt():
+            hazards.append("volatile during quantum travel")
+        if self.get_is_volatile_time():
+            hazards.append("becomes unstable over time")
+        if self.get_is_explosive():
+            hazards.append("explosive")
+        if self.get_is_buggy():
+            hazards.append("known bugs reported recently")
+
+        return hazards
+
+    def get_data_for_ai(self) -> dict:
+        from skills.uexcorp.uexcorp.data_access.commodity_price_data_access import CommodityPriceDataAccess
+        from skills.uexcorp.uexcorp.data_access.commodity_raw_price_data_access import CommodityRawPriceDataAccess
+
+        # Units (aUEC / %) are documented once in the tool help prompt; values
+        # here stay numeric to save tokens. None/0 is stripped as "unknown".
+        information = {
+            "name": self.get_name(),
+            "weight_scu": self.get_weight_scu() or "unknown",
+            "properties": self.get_properties(),
+            "profit_per_scu_min": self.get_profit_min() or None,
+            "profit_per_scu_max": self.get_profit_max() or None,
+            "profit_margin_min": self.get_profit_margin_min() if self.get_profit_min() else None,
+            "profit_margin_max": self.get_profit_margin_max() if self.get_profit_max() else None,
+            "base_profit_min": self.get_base_profit_min() if self.get_profit_min() else None,
+            "base_profit_max": self.get_base_profit_max() if self.get_profit_max() else None,
+            "buy_sell_options": [],
+        }
+
+        if self.get_id_parent() and self.get_id_parent() != self.get_id():
+            parent = Commodity(self.get_id_parent(), load=True)
+            # Name only: the parent's own view would drag in all of its
+            # buy/sell options across every terminal.
+            information["parent"] = str(parent)
+
+        if self.get_is_buyable() or self.get_is_sellable():
+            prices = CommodityPriceDataAccess().add_filter_by_id_commodity(self.get_id()).load()
+            for price in prices:
+                information["buy_sell_options"].append(price.get_data_for_ai_minimal(show_commodity_information=False))
+
+            prices_raw = CommodityRawPriceDataAccess().add_filter_by_id_commodity(self.get_id()).load()
+            for price_raw in prices_raw:
+                information["buy_sell_options"].append(price_raw.get_data_for_ai_minimal(show_commodity_information=False))
+
+        return information
+
+    def get_data_for_ai_minimal(self) -> dict:
+        from skills.uexcorp.uexcorp.data_access.commodity_price_data_access import CommodityPriceDataAccess
+        from skills.uexcorp.uexcorp.data_access.commodity_raw_price_data_access import CommodityRawPriceDataAccess
+
+        information = {
+            "name": self.get_name(),
+            "properties": self.get_properties(),
+            "profit_per_scu_max": self.get_profit_max() or None,
+            "profit_margin_max": self.get_profit_margin_max() if self.get_profit_max() else None,
+            "base_profit_max": self.get_base_profit_max() if self.get_profit_max() else None,
+            "buy_sell_options": [],
+        }
+
+        if self.get_id_parent() and self.get_id_parent() != self.get_id():
+            parent = Commodity(self.get_id_parent(), load=True)
+            information["parent"] = str(parent)
+
+        if self.get_is_buyable() or self.get_is_sellable():
+            # Many terminals share the same price, so options are grouped by
+            # price ("Sell for X at: A, B, C") instead of one line per terminal.
+            from skills.uexcorp.uexcorp import compression
+
+            buy_groups = {}
+            sell_groups = {}
+            prices = CommodityPriceDataAccess().add_filter_by_id_commodity(self.get_id()).load()
+            for price in prices:
+                if price.get_price_buy():
+                    buy_groups.setdefault(price.get_price_buy(), []).append(price.get_terminal_name())
+                if price.get_price_sell():
+                    sell_groups.setdefault(price.get_price_sell(), []).append(price.get_terminal_name())
+
+            raw_sell_groups = {}
+            prices_raw = CommodityRawPriceDataAccess().add_filter_by_id_commodity(self.get_id()).load()
+            for price_raw in prices_raw:
+                if price_raw.get_price_sell():
+                    raw_sell_groups.setdefault(price_raw.get_price_sell(), []).append(price_raw.get_terminal_name())
+
+            options = information["buy_sell_options"]
+            for value in sorted(buy_groups):  # cheapest buy first
+                options.append(f"Buy for {compression.number(value)} at: {', '.join(buy_groups[value])}")
+            for value in sorted(sell_groups, reverse=True):  # best sell first
+                options.append(f"Sell for {compression.number(value)} at: {', '.join(sell_groups[value])}")
+            for value in sorted(raw_sell_groups, reverse=True):
+                options.append(f"Sell (raw) for {compression.number(value)} at: {', '.join(raw_sell_groups[value])}")
+
+        return information
+
+    def __calculate_profit(self) -> None:
+        from skills.uexcorp.uexcorp.data_access.commodity_price_data_access import CommodityPriceDataAccess
+
+        buy_min = None
+        buy_max = None
+        sell_min = None
+        sell_max = None
+        prices = CommodityPriceDataAccess().add_filter_by_id_commodity(self.get_id()).load()
+        for price in prices:
+            if price.get_price_buy() and (buy_min is None or price.get_price_buy() < buy_min):
+                buy_min = price.get_price_buy()
+            if price.get_price_buy() and (buy_max is None or price.get_price_buy() > buy_max):
+                buy_max = price.get_price_buy()
+            if price.get_price_sell() and (sell_min is None or price.get_price_sell() < sell_min):
+                sell_min = price.get_price_sell()
+            if price.get_price_sell() and (sell_max is None or price.get_price_sell() > sell_max):
+                sell_max = price.get_price_sell()
+
+        self.profit_calculated = True
+        self.profit_margin_max = 0
+        self.profit_margin_min = 0
+        self.profit_max = 0
+        self.profit_min = 0
+        self.base_profit_max = 0
+        self.base_profit_min = 0
+
+        if buy_min is not None and buy_min > 0 and sell_max is not None and sell_max > 0:
+            self.profit_max = sell_max - buy_min
+            self.profit_margin_max = self.profit_max / sell_max
+            self.base_profit_max = (sell_max / buy_min) - 1
+        if buy_max is not None and buy_max > 0 and sell_min is not None and sell_min > 0:
+            self.profit_min = sell_min - buy_max
+            self.profit_margin_min = self.profit_min / sell_min
+            self.base_profit_min = (sell_min / buy_max) - 1
+
+    def get_id(self) -> int:
+        return self.data["id"]
+
+    def get_id_parent(self) -> int | None:
+        return self.data["id_parent"]
+
+    def get_name(self) -> str | None:
+        return self.data["name"]
+
+    def get_code(self) -> str | None:
+        return self.data["code"]
+
+    def get_slug(self) -> str | None:
+        return self.data["slug"]
+
+    def get_kind(self) -> str | None:
+        return self.data["kind"]
+
+    def get_weight_scu(self) -> int | None:
+        return self.data["weight_scu"]
+
+    def get_price_buy(self) -> float | None:
+        return self.data["price_buy"]
+
+    def get_price_sell(self) -> float | None:
+        return self.data["price_sell"]
+
+    def get_is_available(self) -> int | None:
+        return self.data["is_available"]
+
+    def get_is_available_live(self) -> int | None:
+        return self.data["is_available_live"]
+
+    def get_is_visible(self) -> int | None:
+        return self.data["is_visible"]
+
+    def get_is_raw(self) -> int | None:
+        return self.data["is_raw"]
+
+    def get_is_refined(self) -> int | None:
+        return self.data["is_refined"]
+
+    def get_is_mineral(self) -> int | None:
+        return self.data["is_mineral"]
+
+    def get_is_harvestable(self) -> int | None:
+        return self.data["is_harvestable"]
+
+    def get_is_buyable(self) -> int | None:
+        return self.data["is_buyable"]
+
+    def get_is_sellable(self) -> int | None:
+        return self.data["is_sellable"]
+
+    def get_is_temporary(self) -> int | None:
+        return self.data["is_temporary"]
+
+    def get_is_illegal(self) -> int | None:
+        return self.data["is_illegal"]
+
+    def get_is_fuel(self) -> int | None:
+        return self.data["is_fuel"]
+
+    def get_wiki(self) -> str | None:
+        return self.data["wiki"]
+
+    def get_date_added(self) -> int | None:
+        return self.data["date_added"]
+
+    def get_date_added_readable(self) -> datetime | None:
+        return datetime.fromtimestamp(self.data["date_added"])
+
+    def get_date_modified(self) -> int | None:
+        return self.data["date_modified"]
+
+    def get_date_modified_readable(self) -> datetime | None:
+        return datetime.fromtimestamp(self.data["date_modified"])
+
+    def get_is_blacklisted(self) -> int | None:
+        return self.data["is_blacklisted"]
+
+    def set_is_blacklisted(self, is_blacklisted: int):
+        self.data["is_blacklisted"] = is_blacklisted
+
+    def get_profit_min(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return self.profit_min
+
+    def get_profit_max(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return self.profit_max
+
+    def get_profit_margin_min(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return round(self.profit_margin_min * 100, 2)
+
+    def get_profit_margin_max(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return round(self.profit_margin_max * 100, 2)
+
+    def get_base_profit_min(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return round(self.base_profit_min * 100, 2)
+
+    def get_base_profit_max(self) -> float | None:
+        if self.profit_calculated is False:
+            self.__calculate_profit()
+        return round(self.base_profit_max * 100, 2)
+
+    def get_id_item(self) -> int | None:
+        return self.data["id_item"]
+
+    def get_ids_star_systems(self) -> str | None:
+        return self.data["ids_star_systems"]
+
+    def get_ids_planets(self) -> str | None:
+        return self.data["ids_planets"]
+
+    def get_ids_moons(self) -> str | None:
+        return self.data["ids_moons"]
+
+    def get_ids_poi(self) -> str | None:
+        return self.data["ids_poi"]
+
+    def get_ids_orbits(self) -> str | None:
+        return self.data["ids_orbits"]
+
+    def get_uuid(self) -> str | None:
+        return self.data["uuid"]
+
+    def get_is_extractable(self) -> int | None:
+        return self.data["is_extractable"]
+
+    def get_is_pure(self) -> int | None:
+        return self.data["is_pure"]
+
+    def get_is_refinable(self) -> int | None:
+        return self.data["is_refinable"]
+
+    def get_is_volatile_qt(self) -> int | None:
+        return self.data["is_volatile_qt"]
+
+    def get_is_volatile_time(self) -> int | None:
+        return self.data["is_volatile_time"]
+
+    def get_is_inert(self) -> int | None:
+        return self.data["is_inert"]
+
+    def get_is_explosive(self) -> int | None:
+        return self.data["is_explosive"]
+
+    def get_is_buggy(self) -> int | None:
+        return self.data["is_buggy"]
+
+    def __str__(self):
+        return str(self.data["name"])

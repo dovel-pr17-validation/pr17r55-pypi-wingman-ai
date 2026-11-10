@@ -1,0 +1,28 @@
+module: skills.image_generation.main
+name: ImageGeneration
+api_version: 3
+display_name: Image Generation
+author: ShipBit
+discoverable_by_default: false
+tags:
+  - Image
+  - Internet
+description:
+  en: Generate images in one of 13 styles, or change an earlier image or one you attach.
+  de: Erzeugt Bilder in einem von 13 Stilen oder ändert ein früheres oder angehängtes Bild.
+discovery_keywords:
+  - create image
+  - generate picture
+  - edit image
+  - change picture
+  - draw
+  - make image
+  - AI art
+  - image creation
+custom_properties:
+  - hint: Whether generated images should be kept. They are always written to your WingmanAI APPDATA directory in a subdirectory called "generated_files" so the client can display them - with this off, only the 25 most recent ones are kept there.
+    id: save_images
+    name: Keep generated images
+    property_type: boolean
+    required: false
+    value: false

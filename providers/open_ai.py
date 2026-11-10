@@ -1,0 +1,632 @@
+from abc import ABC, abstractmethod
+import json
+import re
+from typing import TYPE_CHECKING, Literal, Mapping, Union
+import httpx
+from openai import NOT_GIVEN, NotGiven, Omit, OpenAI, APIStatusError
+from api.enums import ConversationProvider, LogType, ToastType, TtsProvider
+
+from api.interface import (
+    SoundConfig,
+    VoiceInfo,
+)
+from providers.interfaces import (
+    TtsInterface, LlmInterface,
+    tts_provider, llm_provider,
+)
+from services.audio_player import AudioPlayer
+from services.openai_utils import get_minimal_reasoning_by_model
+from services.printr import Printr
+from services.context_budget import ContextOverflowError, is_context_overflow
+
+if TYPE_CHECKING:
+    from api.interface import WingmanConfig
+
+printr = Printr()
+
+
+def _refuses_tools(error: APIStatusError) -> bool:
+    """A 400 for a model that cannot call tools at all, like gemma3 on Ollama:
+    `registry.ollama.ai/library/gemma3:4b does not support tools`."""
+    text = f"{getattr(error, 'message', '') or ''} {error}".lower()
+    return error.status_code == 400 and "does not support tools" in text
+
+
+class BaseOpenAi(ABC):
+    # (server, model) pairs that refused tools. The request goes without them
+    # from then on, instead of failing every message of a wingman with skills.
+    _models_without_tools: set[tuple[str, str]] = set()
+
+    @abstractmethod
+    def _create_client(self, *args, **kwargs):
+        """Subclasses should implement this method to create their specific client."""
+
+    def _handle_key_error(self):
+        printr.toast_error(
+            "The OpenAI API key you provided is invalid. Please check the GUI settings or your 'secrets.yaml'"
+        )
+
+    def _handle_api_error(self, api_response):
+        printr.toast_error(
+            f"The OpenAI API sent the following error code {api_response.status_code} ({api_response.type})"
+        )
+        m = re.search(
+            r"'message': (?P<quote>['\"])(?P<message>.+?)(?P=quote)",
+            api_response.message,
+        )
+        if m is not None:
+            message = m["message"].replace(". ", ".\n")
+            printr.toast_error(message)
+        elif api_response.message:
+            printr.toast_error(api_response.message)
+        else:
+            printr.toast_error("The API did not provide further information.")
+
+    def _perform_transcription(
+        self,
+        client: OpenAI,
+        filename: str,
+        model: Literal["whisper-1"],
+    ):
+        try:
+            with open(filename, "rb") as audio_input:
+                transcript = client.audio.transcriptions.create(
+                    model=model, file=audio_input
+                )
+                return transcript
+        except APIStatusError as e:
+            self._handle_api_error(e)
+        except UnicodeEncodeError:
+            self._handle_key_error()
+
+        return None
+
+    def get_minimal_reasoning_by_model(self, model_name: str) -> dict:
+        """
+        Returns the minimal reasoning effort setting based on the model name.
+        This helps reduce latency by setting the lowest supported reasoning effort.
+        See https://platform.openai.com/docs/api-reference/chat/create#chat_create-reasoning_effort
+
+        Args:
+            model_name: The name of the OpenAI model
+
+        Returns:
+            dict: Dictionary with reasoning_effort key if applicable, empty dict otherwise
+        """
+        # Models that don't support reasoning effort parameter
+        if model_name in ["o1-mini", "gpt-5.2-chat-latest"]:
+            return {}
+
+        # o-series models (o1, o3, etc.) support "low" as minimal
+        if model_name.startswith("o"):
+            return {"reasoning_effort": "low"}
+
+        # gpt-5.x models (5.1, 5.2, etc.) support "none" as minimal
+        if model_name.startswith("gpt-5."):
+            return {"reasoning_effort": "none"}
+
+        # gpt-5 base models support "minimal" as lowest effort
+        if model_name.startswith("gpt-5"):
+            return {"reasoning_effort": "minimal"}
+
+        # Other models don't support reasoning effort
+        return {}
+
+    def _perform_ask(
+        self,
+        client: OpenAI,
+        messages: list[dict[str, str]],
+        stream: bool,
+        tools: list[dict[str, any]],
+        model: str = None,
+        tool_choice: str = "auto",
+    ):
+        server_model = (str(getattr(client, "base_url", "")), model)
+        if tools and server_model in self._models_without_tools:
+            tools = None
+        try:
+            # Get minimal reasoning effort for the model to reduce latency
+            reasoning_params = (
+                self.get_minimal_reasoning_by_model(model) if model else {}
+            )
+
+            if not tools:
+                completion = client.chat.completions.create(
+                    stream=stream,
+                    messages=messages,
+                    model=model,
+                    **reasoning_params,
+                )
+            else:
+                completion = client.chat.completions.create(
+                    stream=stream,
+                    messages=messages,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    **reasoning_params,
+                )
+            return completion
+        except APIStatusError as e:
+            # A request larger than the model's window is not a dead end: the
+            # wingman learns the window from it, shortens and retries once.
+            if is_context_overflow(getattr(e, "message", "") or str(e)):
+                raise ContextOverflowError(getattr(e, "message", "") or str(e)) from e
+            if tools and _refuses_tools(e):
+                self._models_without_tools.add(server_model)
+                printr.print(
+                    f"{model} cannot use tools, so skills and commands are left out of its calls. "
+                    "Pick a model with tool support to use them.",
+                    color=LogType.WARNING,
+                    toast=ToastType.WARNING,
+                )
+                return self._perform_ask(
+                    client, messages, stream, None, model=model, tool_choice=tool_choice
+                )
+            self._handle_api_error(e)
+            return None
+        except UnicodeEncodeError:
+            self._handle_key_error()
+            return None
+
+
+class OpenAi(BaseOpenAi):
+    def __init__(
+        self,
+        api_key: str = "",
+        organization: str | None = None,
+        base_url: str | None = None,
+    ):
+        super().__init__()
+        self.api_key = api_key
+        self.client = self._create_client(
+            api_key=api_key,
+            organization=organization,
+            base_url=base_url,
+        )
+
+    def _create_client(
+        self,
+        api_key: str,
+        organization: str | None = None,
+        base_url: str | None = None,
+    ):
+        """Create an OpenAI client with the given parameters."""
+        return OpenAI(
+            api_key=api_key,
+            organization=organization,
+            base_url=base_url,
+        )
+
+    def transcribe(self, filename: str, model: str = "whisper-1"):
+        return self._perform_transcription(
+            client=self.client, filename=filename, model=model
+        )
+
+    def ask(
+        self,
+        messages: list[dict[str, str]],
+        model: str = None,
+        stream: bool = False,
+        tools: list[dict[str, any]] = None,
+        tool_choice: str = "auto",
+    ):
+        return self._perform_ask(
+            client=self.client,
+            messages=messages,
+            model=model,
+            stream=stream,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+    async def play_audio(
+        self,
+        text: str,
+        voice: str,
+        model: str,
+        speed: float,
+        sound_config: SoundConfig,
+        audio_player: AudioPlayer,
+        wingman_name: str,
+        stream: bool,
+    ):
+        # instructions = config.instructions # Instructions are for gpt-4o-mini-tts model only
+        try:
+            if not stream:
+                # Non-streaming implementation
+                response = self.client.audio.speech.create(
+                    input=text,
+                    model=model,
+                    voice=voice,
+                    speed=speed,
+                    # instructions=instructions,
+                )
+                if response is not None:
+                    await audio_player.play_with_effects(
+                        input_data=response.content,
+                        config=sound_config,
+                        wingman_name=wingman_name,
+                    )
+            else:
+                # Streaming implementation
+                with self.client.audio.speech.with_streaming_response.create(
+                    input=text,
+                    model=model,
+                    voice=voice,
+                    speed=speed,
+                    response_format="pcm",
+                    # instructions=instructions,
+                ) as response:
+                    # Create an iterator for the audio chunks. We can set the chunk size here.
+                    audio_stream_iterator = response.iter_bytes(chunk_size=1024)
+
+                    # This callback is passed to the audio_player and called repeatedly to fill its buffer.
+                    def buffer_callback(audio_buffer):
+                        """
+                        Fetches the next chunk from the audio stream and loads it
+                        into the player's buffer.
+                        """
+                        try:
+                            # Get the next chunk of audio data from the iterator
+                            chunk = next(audio_stream_iterator)
+                            chunk_size = len(chunk)
+
+                            # Copy the received audio data into the buffer provided by the audio player
+                            audio_buffer[:chunk_size] = chunk
+
+                            # Return the number of bytes written
+                            return chunk_size
+                        except StopIteration:
+                            # When the iterator is exhausted, it raises StopIteration.
+                            # We catch it and return 0 to signal the end of the stream.
+                            return 0
+
+                    # OpenAI's PCM output is 24kHz, 16-bit, single-channel.
+                    await audio_player.stream_with_effects(
+                        buffer_callback=buffer_callback,
+                        config=sound_config,
+                        wingman_name=wingman_name,
+                        sample_rate=24000,
+                        dtype="int16",
+                        channels=1,
+                        use_gain_boost=True,  # All streaming PCM TTS providers need this
+                    )
+
+        except APIStatusError as e:
+            self._handle_api_error(e)
+        except UnicodeEncodeError:
+            self._handle_key_error()
+
+
+class OpenAiCompatibleTts:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str | None = None,
+    ):
+        super().__init__()
+        self._api_key = api_key
+        self._base_url = base_url
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+
+    async def get_available_voices(
+        self, voices_endpoint: str | None
+    ) -> list[VoiceInfo]:
+        """Retrieve available voices from an OpenAI-compatible endpoint.
+
+        If `voices_endpoint` is not provided, or the request fails for any reason,
+        returns an empty list.
+        """
+
+        if not voices_endpoint:
+            return []
+
+        if not self._base_url:
+            return []
+
+        url = f"{self._base_url.rstrip('/')}/{voices_endpoint.lstrip('/')}"
+
+        try:
+            headers: dict[str, str] = {}
+            if self._api_key:
+                headers["Authorization"] = f"Bearer {self._api_key}"
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as e:
+                printr.print(
+                    f"OpenAI-compatible voices: invalid JSON from {url}: {e}",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+                return []
+
+            items = payload.get("data", []) if isinstance(payload, dict) else []
+            if not isinstance(items, list):
+                return []
+
+            voices: list[VoiceInfo] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                voice_id = item.get("id")
+                if not voice_id:
+                    continue
+                voices.append(VoiceInfo(id=str(voice_id), name=str(voice_id)))
+            return voices
+        except httpx.HTTPStatusError as e:
+            # Non-2xx response
+            printr.print(
+                f"OpenAI-compatible voices: HTTP {e.response.status_code} from {url}: {e}",
+                color=LogType.WARNING,
+                server_only=True,
+            )
+            return []
+        except httpx.RequestError as e:
+            # Intentionally silent for UI polling; callers expect [] on failures.
+            printr.print(
+                f"OpenAI-compatible voices: request failed for {url}: {e}",
+                color=LogType.WARNING,
+                server_only=True,
+            )
+            return []
+
+    async def play_audio(
+        self,
+        text: str,
+        voice: str,
+        model: str,
+        sound_config: SoundConfig,
+        audio_player: AudioPlayer,
+        wingman_name: str,
+        stream: bool,
+        speed: float | NotGiven = NOT_GIVEN,
+        response_format: (
+            NotGiven | Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
+        ) = NOT_GIVEN,
+        extra_headers: Mapping[str, Union[str, Omit]] | None = None,
+    ):
+        # instructions = config.instructions # No current open source model supports this but adding for full compatibility
+
+        # Should sample rate and response format be configurable in UI to ensure widest compatibilty?
+
+        try:
+            if not stream:
+                # Non-streaming implementation
+                response = self.client.audio.speech.create(
+                    input=text,
+                    model=model,
+                    voice=voice,
+                    speed=speed,
+                    response_format=response_format,
+                    # instructions=instructions,
+                    extra_headers=extra_headers,
+                )
+                if response is not None:
+                    await audio_player.play_with_effects(
+                        input_data=response.content,
+                        config=sound_config,
+                        wingman_name=wingman_name,
+                    )
+            else:
+                # Streaming implementation
+                with self.client.audio.speech.with_streaming_response.create(
+                    input=text,
+                    model=model,
+                    voice=voice,
+                    speed=speed,
+                    response_format="pcm",
+                    # instructions=instructions,
+                    extra_headers=extra_headers,
+                ) as response:
+                    # Create an iterator for the audio chunks. We can set the chunk size here.
+                    audio_stream_iterator = response.iter_bytes(chunk_size=1024)
+
+                    # This callback is passed to the audio_player and called repeatedly
+                    # to fill its buffer.
+                    def buffer_callback(audio_buffer):
+                        """
+                        Fetches the next chunk from the audio stream and loads it
+                        into the player's buffer.
+                        """
+                        try:
+                            # Get the next chunk of audio data from the iterator
+                            chunk = next(audio_stream_iterator)
+                            chunk_size = len(chunk)
+
+                            # Copy the received audio data into the buffer provided by the audio player
+                            audio_buffer[:chunk_size] = chunk
+
+                            # Return the number of bytes written
+                            return chunk_size
+                        except StopIteration:
+                            # When the iterator is exhausted, it raises StopIteration.
+                            # We catch it and return 0 to signal the end of the stream.
+                            return 0
+
+                    await audio_player.stream_with_effects(
+                        buffer_callback=buffer_callback,
+                        config=sound_config,
+                        wingman_name=wingman_name,
+                        sample_rate=24000,
+                        dtype="int16",
+                        channels=1,
+                        use_gain_boost=True,  # All streaming PCM TTS providers need this
+                    )
+
+        except APIStatusError as e:
+            printr.toast_error(
+                f"OpenAI-compatible TTS error: {e.status_code} ({e.type})"
+            )
+            m = re.search(
+                r"'message': (?P<quote>['\"])(?P<message>.+?)(?P=quote)",
+                e.message,
+            )
+            if m is not None:
+                message = m["message"].replace(". ", ".\n")
+                printr.toast_error(message)
+            elif e.message:
+                printr.toast_error(e.message)
+            else:
+                printr.toast_error(
+                    "An unknown OpenAI-compatible TTS error has occurred."
+                )
+
+
+@tts_provider(TtsProvider.OPENAI)
+class OpenAiTts(TtsInterface):
+    """OpenAI TTS via the unified interface."""
+
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def play_audio(self, text, sound_config, audio_player, wingman_name):
+        await self._openai.play_audio(
+            text=text,
+            voice=self._config.openai.tts_voice,
+            model=self._config.openai.tts_model,
+            speed=self._config.openai.tts_speed,
+            sound_config=sound_config,
+            audio_player=audio_player,
+            wingman_name=wingman_name,
+            stream=self._config.openai.output_streaming,
+        )
+
+
+@llm_provider(ConversationProvider.OPENAI)
+class OpenAiLlm(LlmInterface):
+    """OpenAI chat completions via the unified interface."""
+
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        return self._openai.ask(
+            messages=messages,
+            tools=tools, tool_choice=tool_choice,
+            model=self._config.openai.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.MISTRAL)
+class MistralLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        return self._openai.ask(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            model=self._config.mistral.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.GROQ)
+class GroqLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        return self._openai.ask(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            model=self._config.groq.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.CEREBRAS)
+class CerebrasLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        return self._openai.ask(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            model=self._config.cerebras.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.OPENROUTER)
+class OpenRouterLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig",
+                 supports_tools: bool = False, context_window: int | None = None):
+        self._openai = openai_instance
+        self._config = config
+        self.supports_tools = supports_tools
+        self.context_window = context_window
+        """The smallest window among the model's endpoints, from OpenRouter;
+        the wingman sizes its budget from it (services/context_budget.py)."""
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        effective_tools = tools if self.supports_tools else None
+        return self._openai.ask(
+            messages=messages, tools=effective_tools, tool_choice=tool_choice,
+            model=self._config.openrouter.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.LOCAL_LLM)
+class LocalLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi | None", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        if not self._openai:
+            raise RuntimeError(
+                f"Local LLM provider is not initialized. "
+                f"Please check your Local LLM endpoint configuration "
+                f"({self._config.local_llm.endpoint})."
+            )
+        return self._openai.ask(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            model=self._config.local_llm.conversation_model,
+        )
+
+
+@llm_provider(ConversationProvider.PERPLEXITY)
+class PerplexityLlm(LlmInterface):
+    def __init__(self, openai_instance: "OpenAi", config: "WingmanConfig"):
+        self._openai = openai_instance
+        self._config = config
+
+    async def ask(self, messages, tools=None, tool_choice="auto"):
+        return self._openai.ask(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            model=self._config.perplexity.conversation_model.value,
+        )
+
+
+@tts_provider(TtsProvider.OPENAI_COMPATIBLE)
+class OpenAiCompatibleTtsAdapter(TtsInterface):
+    def __init__(self, tts_instance: "OpenAiCompatibleTts", config: "WingmanConfig"):
+        self._tts = tts_instance
+        self._config = config
+
+    async def play_audio(self, text, sound_config, audio_player, wingman_name):
+        from openai import NOT_GIVEN
+        await self._tts.play_audio(
+            text=text,
+            voice=self._config.openai_compatible_tts.voice,
+            model=self._config.openai_compatible_tts.model,
+            speed=(
+                self._config.openai_compatible_tts.speed
+                if self._config.openai_compatible_tts.speed
+                else NOT_GIVEN
+            ),
+            sound_config=sound_config,
+            audio_player=audio_player,
+            wingman_name=wingman_name,
+            stream=self._config.openai_compatible_tts.output_streaming,
+        )

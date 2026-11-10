@@ -1,0 +1,26 @@
+module: skills.control_windows.main
+name: ControlWindows
+api_version: 3
+display_name: Control Windows
+author: teddybear082
+platforms:
+  - windows
+  - darwin
+  - linux
+tags:
+  - Utility
+description:
+  en: Launch, switch, arrange and close applications on your computer. Utilize the clipboard of your computer.
+  de: Starte, wechsle, ordne und schließe Anwendungen auf deinem Computer. Nutze die Zwischenablage deines Computers.
+discovery_keywords:
+  - launch app
+  - open program
+  - start application
+  - clipboard
+  - copy
+  - paste
+  - window control
+discoverable_by_default: false
+hint:
+  en: "Windows: apps are found in your Start Menu (%APPDATA%/Microsoft/Windows/Start Menu/Programs), so add a shortcut there if one is missing. macOS: apps are found in your Applications folders, and moving windows needs the Accessibility permission. Linux: apps are found by their menu entries. Windows can be controlled in X11, and in a Wayland session those that run through XWayland. The clipboard needs wl-clipboard or xclip."
+  de: "Windows: Anwendungen werden in deinem Startmenü gesucht (%APPDATA%/Microsoft/Windows/Start Menu/Programs), lege dort eine Verknüpfung an, wenn eine fehlt. macOS: Anwendungen werden in deinen Programme-Ordnern gesucht, und Fenster verschieben braucht die Berechtigung für Bedienungshilfen. Linux: Anwendungen werden über ihre Menüeinträge gefunden. Fenster lassen sich unter X11 steuern, in einer Wayland-Sitzung die, die über XWayland laufen. Die Zwischenablage braucht wl-clipboard oder xclip."

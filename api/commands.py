@@ -1,0 +1,283 @@
+from typing import Literal, Optional
+from pydantic import BaseModel
+from api.enums import (
+    CommandTag,
+    CoreState,
+    KeyboardRecordingType,
+    LogSource,
+    LogType,
+    RecordingDevice,
+    ToastType,
+)
+from api.interface import (
+    AudioFile,
+    BenchmarkResult,
+    CommandActionConfig,
+    InputBinding,
+    HudProfilesState,
+    ScGameLogStatus,
+    ScTelemetryStatus,
+    TokenUsage,
+)
+
+
+# We use this Marker base class for reflection to "iterate all commands"
+class WebSocketCommandModel(BaseModel):
+    command: str
+
+
+# RECEIVED FROM CLIENT
+
+
+class ClientReadyCommand(WebSocketCommandModel):
+    command: Literal["client_ready"] = "client_ready"
+
+
+# TODO: make this a regular POST request
+class SaveSecretCommand(WebSocketCommandModel):
+    command: Literal["save_secret"] = "save_secret"
+    secret_name: str
+    secret_value: str
+    show_message: Optional[bool] = True
+
+
+class RecordKeyboardActionsCommand(WebSocketCommandModel):
+    command: Literal["record_keyboard_actions"] = "record_keyboard_actions"
+    recording_type: KeyboardRecordingType
+
+
+class RecordMouseActionsCommand(WebSocketCommandModel):
+    command: Literal["record_mouse_actions"] = "record_mouse_actions"
+
+
+class RecordJoystickActionsCommand(WebSocketCommandModel):
+    command: Literal["record_joystick_actions"] = "record_joystick_actions"
+
+
+class StopRecordingCommand(WebSocketCommandModel):
+    command: Literal["stop_recording"] = "stop_recording"
+    recording_type: KeyboardRecordingType = KeyboardRecordingType.SINGLE
+    recording_device: RecordingDevice = RecordingDevice.KEYBOARD
+    add_key: Optional[str] = None
+    """A key the user picked from a button instead of pressing it: Esc stops
+    the recording and the F keys belong to the app, so neither can be
+    recorded. A single recording becomes this key, a macro gets it appended.
+    Only the names in ``services.command_handler.PICKABLE_KEYS``."""
+
+
+class ClientLoggedInCommand(WebSocketCommandModel):
+    command: Literal["client_logged_in"] = "client_logged_in"
+    plan: str
+    account_name: str
+    user_id: Optional[str] = None
+    """Supabase user ID, for error reports. Older clients do not send it."""
+
+
+class ClientLoggedOutCommand(WebSocketCommandModel):
+    command: Literal["client_logged_out"] = "client_logged_out"
+
+
+# SENT TO CLIENT
+
+
+class LogCommand(WebSocketCommandModel):
+    command: Literal["log"] = "log"
+    text: str
+    log_type: LogType
+    source_name: Optional[str] = None
+    wingman_name: Optional[str] = None
+    source: LogSource = LogSource.SYSTEM
+    tag: Optional[CommandTag] = None
+    skill_name: Optional[str] = None
+    additional_data: Optional[dict] = None
+    benchmark_result: Optional[BenchmarkResult] = None
+    token_usage: Optional[TokenUsage] = None
+    """What the turn behind this message used. None on every message that did
+    not come out of a model call."""
+
+
+class PromptSecretCommand(WebSocketCommandModel):
+    command: Literal["prompt_secret"] = "prompt_secret"
+    requester: str
+    secret_name: str
+
+
+class ToastCommand(WebSocketCommandModel):
+    command: Literal["toast"] = "toast"
+    text: str
+    toast_type: ToastType
+
+
+class ActionsRecordedCommand(WebSocketCommandModel):
+    command: Literal["actions_recorded"] = "actions_recorded"
+    actions: list[CommandActionConfig]
+    binding: Optional[InputBinding] = None
+    """For a single recording: the key combination, mouse or joystick button
+    (with the keys held along) as a binding. None for macros."""
+
+
+class VoiceActivationMutedCommand(WebSocketCommandModel):
+    command: Literal["voice_activation_muted"] = "voice_activation_muted"
+    muted: bool
+
+
+class SttVocabularyChangedCommand(WebSocketCommandModel):
+    """Sent when the vocabulary changes outside the settings page: a wingman
+    tool taught a spelling, or the names were seeded after a login. The page
+    holds the block it loaded and would write the old list back without this."""
+
+    command: Literal["stt_vocabulary_changed"] = "stt_vocabulary_changed"
+    vocabulary: list[str]
+
+
+class HudProfilesChangedCommand(WebSocketCommandModel):
+    """Sent when the HUD profiles change outside the settings page too: a
+    container dragged in the preview, a config switch that picks another
+    profile, the HUD server starting or stopping."""
+
+    command: Literal["hud_profiles_changed"] = "hud_profiles_changed"
+    state: HudProfilesState
+
+
+class McpStateChangedCommand(WebSocketCommandModel):
+    """Sent when MCP server connection state changes (connected/disconnected)."""
+
+    command: Literal["mcp_state_changed"] = "mcp_state_changed"
+    wingman_name: str
+    """The wingman whose MCP state changed."""
+
+
+class McpOAuthStateChangedCommand(WebSocketCommandModel):
+    """Sent when an MCP OAuth flow finishes, either way.
+
+    The client starts a flow and then has nothing to poll: the user is in a
+    browser, and the token arrives on a completely different route. This is how
+    the settings UI learns it can stop showing a spinner.
+    """
+
+    command: Literal["mcp_oauth_state_changed"] = "mcp_oauth_state_changed"
+    mcp_name: str
+    """The MCP server whose authorization state changed."""
+    is_authorized: bool
+    """True when a token was stored, False when the attempt failed."""
+    error: Optional[str] = None
+    """Why it failed, when it did."""
+
+
+class SkillDialogCommand(WebSocketCommandModel):
+    """A skill asks the client to show a dialog (`self.wingman.ui.show_dialog`)."""
+
+    command: Literal["skill_dialog"] = "skill_dialog"
+    wingman_name: str
+    title: str
+    text: str
+    """Markdown. The client sanitizes it and opens links in the browser."""
+    image: Optional[str] = None
+    """A data URL, shown under the text."""
+
+
+class SubscriptionTokenSavedCommand(WebSocketCommandModel):
+    """Sent when the client has saved the subscription's device token. Core can
+    ask the backend from now on; the client waits for this before it asks Core
+    for anything that needs the token."""
+
+    command: Literal["subscription_token_saved"] = "subscription_token_saved"
+
+
+class ScGameLogStateChangedCommand(WebSocketCommandModel):
+    """Sent when the Star Citizen log reader starts, stops, finds a Game.log
+    or gets new rules, and when the rules cannot be updated."""
+
+    command: Literal["sc_gamelog_state_changed"] = "sc_gamelog_state_changed"
+    status: ScGameLogStatus
+
+
+class ScTelemetryStateChangedCommand(WebSocketCommandModel):
+    """Sent when Star Citizen's telemetry connects, goes live, drops, or the
+    pilot changes ships."""
+
+    command: Literal["sc_telemetry_state_changed"] = "sc_telemetry_state_changed"
+    status: ScTelemetryStatus
+
+
+class AudioLibraryPlaybackFinishedCommand(WebSocketCommandModel):
+    command: Literal["audio_library_playback_finished"] = (
+        "audio_library_playback_finished"
+    )
+    audio_file: AudioFile
+
+
+class CoreStateChangedCommand(WebSocketCommandModel):
+    """Sent when the Core lifecycle state changes.
+
+    The client should use this to update UI accordingly (show loading spinner,
+    etc.). Note that if the Core crashes, it will NOT be able
+    to send a state change - the client must detect WebSocket disconnection and
+    failed /ping requests to determine that Core has crashed.
+    """
+
+    command: Literal["core_state_changed"] = "core_state_changed"
+    state: CoreState
+    """The current state of Wingman AI Core."""
+    message: Optional[str] = None
+    """Human-readable sub-step detail (e.g. 'Downloading Qwen3.5-4B...')."""
+    progress: Optional[float] = None
+    """0.0–1.0 progress for operations with known duration (e.g. downloads)."""
+
+
+class ConversationCondensationCommand(WebSocketCommandModel):
+    """Sent when conversation condensation starts or finishes for a wingman."""
+
+    command: Literal["conversation_condensation"] = "conversation_condensation"
+    wingman_name: str
+    """The wingman whose conversation is being condensed."""
+    status: str
+    """'started' or 'finished'."""
+    messages_condensed: Optional[int] = None
+    """Number of messages that were condensed (only on finish)."""
+    messages_remaining: Optional[int] = None
+    """Number of messages remaining after condensation (only on finish)."""
+    summary_length: Optional[int] = None
+    """Character length of the summary (only on finish)."""
+    estimated_tokens_saved: Optional[int] = None
+    """Rough estimate of tokens saved by condensation (only on finish)."""
+    summary_text: Optional[str] = None
+    """The actual summary text (only on finish)."""
+
+
+class ConversationTokenUsageCommand(WebSocketCommandModel):
+    """Sent after each LLM call with actual API-reported token usage."""
+
+    command: Literal["conversation_token_usage"] = "conversation_token_usage"
+    wingman_name: str
+    """The wingman that made the LLM call."""
+    prompt_tokens: int
+    """Tokens sent to the LLM (system prompt + history + tools)."""
+    completion_tokens: int
+    """Tokens in the LLM response."""
+    is_local: bool = False
+    """True for LOCAL_LLM provider (free, not billed)."""
+    history_tokens: int = 0
+    """Estimated tokens of the conversation history inside ``prompt_tokens`` — the
+    part condensation and trimming can shrink. The rest is system prompt, memory
+    and tool definitions."""
+    summary_tokens: int = 0
+    """Estimated tokens of the running conversation summary, if any."""
+
+
+class SkillRegisteredCommand(WebSocketCommandModel):
+    """Sent when a skill registers during Core startup."""
+
+    command: Literal["skill_registered"] = "skill_registered"
+    skill: str
+    """Name of the skill that registered."""
+    origin: str
+    """Where the skill came from: 'bundled' | 'custom'."""
+    outcome: str
+    """Registration outcome: 'ok' | 'failed' | 'quarantined' | 'legacy_v2'."""
+    id_hash: str
+    """Hash of the skill's identity."""
+    version: Optional[str] = None
+    """Skill version if available."""
+    api_version: Optional[int] = None
+    """Skill API version if available."""

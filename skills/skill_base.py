@@ -1,0 +1,990 @@
+import asyncio
+import inspect
+import re
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Optional,
+    Union,
+    get_type_hints,
+    get_origin,
+    get_args,
+)
+import warnings
+from api.enums import LogType, WingmanInitializationErrorType
+from api.interface import (
+    SettingsConfig,
+    SkillConfig,
+    SoundConfig,
+    WingmanInitializationError,
+)
+from services.benchmark import Benchmark
+from services.printr import Printr
+from services.secret_keeper import SecretKeeper
+
+if TYPE_CHECKING:
+    from wingmen.wingman_context import WingmanContext
+
+
+class SkillLog:
+    """Friendly logging for skills. Wraps Printr. server_only=True keeps a line out of the
+    client toast/log and only in the server console."""
+
+    def __init__(self, name: str) -> None:
+        self._printr = Printr()
+        self._name = name
+
+    def info(self, message: str, server_only: bool = False) -> None:
+        self._printr.print(f"[{self._name}] {message}", LogType.INFO, server_only=server_only)
+
+    def warning(self, message: str, server_only: bool = False) -> None:
+        self._printr.print(f"[{self._name}] {message}", LogType.WARNING, server_only=server_only)
+
+    def error(self, message: str, server_only: bool = False) -> None:
+        self._printr.print(f"[{self._name}] {message}", LogType.ERROR, server_only=server_only)
+
+
+# Type mapping from Python types to JSON Schema types
+_TYPE_MAP = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+    type(None): "null",
+}
+
+
+def _python_type_to_json_schema(py_type: Any) -> dict:
+    """
+    Convert a Python type annotation to a JSON Schema type definition.
+    Inspired by FastMCP's func_metadata.py approach.
+    """
+    # Handle None
+    if py_type is None or py_type is type(None):
+        return {"type": "null"}
+
+    # Handle basic types
+    if py_type in _TYPE_MAP:
+        return {"type": _TYPE_MAP[py_type]}
+
+    # Handle Optional[X] which is Union[X, None]
+    origin = get_origin(py_type)
+    args = get_args(py_type)
+
+    # Handle Literal types for static enums
+    if origin is Literal:
+        # Get all literal values
+        literal_values = list(args)
+        # Determine the type from the first value
+        if literal_values:
+            first_val = literal_values[0]
+            if isinstance(first_val, str):
+                return {"type": "string", "enum": literal_values}
+            elif isinstance(first_val, int):
+                return {"type": "integer", "enum": literal_values}
+            elif isinstance(first_val, float):
+                return {"type": "number", "enum": literal_values}
+        return {"type": "string", "enum": literal_values}
+
+    if origin is Union:
+        # Filter out None from union
+        non_none_args = [a for a in args if a is not type(None)]
+        if len(non_none_args) == 1:
+            # This is Optional[X]
+            return _python_type_to_json_schema(non_none_args[0])
+        else:
+            # This is a real union
+            return {"anyOf": [_python_type_to_json_schema(a) for a in args]}
+
+    # Handle List[X]
+    if origin is list:
+        if args:
+            return {"type": "array", "items": _python_type_to_json_schema(args[0])}
+        return {"type": "array"}
+
+    # Handle Dict[K, V]
+    if origin is dict:
+        return {"type": "object"}
+
+    # Fallback for unknown types
+    return {"type": "string"}
+
+
+_ARGS_HEADERS = ("Args", "Arguments", "Parameters")
+_SECTION_HEADER = re.compile(
+    r"(Args|Arguments|Parameters|Returns?|Raises|Yields?|Examples?|Notes?):"
+)
+_ARG_LINE = re.compile(r"\*{0,2}(\w+)\s*(?:\([^)]*\))?\s*:\s*(.*)")
+
+
+def _parse_docstring(doc: Optional[str]) -> tuple[str, dict[str, str]]:
+    """Split a Google-style docstring into its summary and the `Args:` descriptions.
+
+    A parameter's description may go on over more lines, indented deeper than
+    the parameter name. Every other section (Returns, Raises, ...) is dropped.
+    """
+    if not doc:
+        return "", {}
+    summary: list[str] = []
+    params: dict[str, list[str]] = {}
+    section = None
+    param_indent = None
+    current = None
+    for line in inspect.cleandoc(doc).splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header = _SECTION_HEADER.fullmatch(stripped)
+        if header:
+            section = header.group(1)
+            param_indent = None
+            current = None
+            continue
+        if section is None:
+            summary.append(stripped)
+            continue
+        if section not in _ARGS_HEADERS:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if param_indent is None:
+            param_indent = indent
+        match = _ARG_LINE.fullmatch(stripped)
+        if indent <= param_indent and match:
+            current = match.group(1)
+            params[current] = [match.group(2)] if match.group(2) else []
+        elif current:
+            params[current].append(stripped)
+    return " ".join(summary), {
+        name: " ".join(parts) for name, parts in params.items() if parts
+    }
+
+
+def _generate_tool_schema(
+    func: Callable,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> tuple[str, dict]:
+    """
+    Generate an OpenAI-compatible tool schema from a function's signature and type hints.
+
+    This implements the same pattern as FastMCP's Tool.from_function(), automatically
+    generating inputSchema from the function signature.
+
+    Args:
+        func: The function to generate a schema for
+        name: Override the function name
+        description: Override the docstring description
+
+    Returns:
+        Tuple of (tool_name, tool_definition_dict)
+    """
+    tool_name = name or func.__name__
+    doc_summary, param_descriptions = _parse_docstring(func.__doc__)
+    tool_description = description or doc_summary or f"Execute {tool_name}"
+
+    # Clean up multiline descriptions
+    tool_description = " ".join(tool_description.split())
+
+    # Get function signature and type hints
+    sig = inspect.signature(func)
+    try:
+        hints = get_type_hints(func)
+    except Exception:
+        hints = {}
+
+    # Build parameters schema
+    properties = {}
+    required = []
+
+    for param_name, param in sig.parameters.items():
+        # Skip self, cls, and special parameters
+        if param_name in ("self", "cls", "benchmark", "kwargs"):
+            continue
+
+        # Get type from hints or default to string
+        param_type = hints.get(param_name, str)
+        param_schema = _python_type_to_json_schema(param_type)
+
+        param_schema["description"] = param_descriptions.get(
+            param_name, f"The {param_name.replace('_', ' ')}"
+        )
+
+        properties[param_name] = param_schema
+
+        # Required if no default value
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+
+    # Build the tool definition in OpenAI format
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": tool_description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+            },
+        },
+    }
+
+    if required:
+        tool_def["function"]["parameters"]["required"] = required
+
+    return tool_name, tool_def
+
+
+class ToolDefinition:
+    """
+    Stores metadata about a tool registered via @tool decorator.
+    """
+
+    def __init__(
+        self,
+        func: Callable,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        summarize: bool = True,
+        wait_response: bool = False,
+    ):
+        self.func = func
+        self.name = name or func.__name__
+        self.description = description
+        self.summarize = summarize
+        self.wait_response = wait_response
+        self.is_async = asyncio.iscoroutinefunction(func)
+
+        # Generate the schema
+        self.tool_name, self.tool_schema = _generate_tool_schema(
+            func, name=self.name, description=self.description
+        )
+        self._parameters = [
+            p
+            for name, p in inspect.signature(func).parameters.items()
+            if name not in ("self", "cls")
+        ]
+
+    def _argument_problem(self, parameters: dict[str, Any]) -> Optional[str]:
+        """
+        What is wrong with the model's arguments, in words it can act on.
+
+        A wrong name raised a TypeError that only said "ERROR DURING PROCESSING"
+        to the model and an error to Sentry: on 3.2.11 `open_folder` got
+        `folder_path`, the parameter name of `load_folder_contents`.
+        """
+        params = self._parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+            return None
+        names = [p.name for p in params]
+        unknown = [name for name in parameters if name not in names]
+        missing = [
+            p.name
+            for p in params
+            if p.default is inspect.Parameter.empty
+            and p.kind is not inspect.Parameter.VAR_POSITIONAL
+            and p.name not in parameters
+        ]
+        if not unknown and not missing:
+            return None
+        expected = ", ".join(
+            p.name if p.default is inspect.Parameter.empty else f"{p.name} (optional)"
+            for p in params
+            if p.kind is not inspect.Parameter.VAR_POSITIONAL
+        )
+        problems = []
+        if unknown:
+            problems.append(f"unknown argument {', '.join(unknown)}")
+        if missing:
+            problems.append(f"missing argument {', '.join(missing)}")
+        return (
+            f"The call to '{self.tool_name}' was not made: {'; '.join(problems)}. "
+            f"It takes: {expected or 'no arguments'}. Call it again with these names."
+        )
+
+    async def execute(self, parameters: dict[str, Any], skill_instance: "Skill") -> Any:
+        """Execute the tool function with the given parameters."""
+        problem = self._argument_problem(parameters)
+        if problem:
+            return problem
+        # Bind self if this is an instance method
+        if self.is_async:
+            return await self.func(skill_instance, **parameters)
+        else:
+            return self.func(skill_instance, **parameters)
+
+
+def tool(
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    summarize: bool = True,
+    wait_response: bool = False,
+):
+    """
+    Decorator to register a method as a tool in a Skill.
+
+    Inspired by FastMCP's @mcp.tool() decorator, this automatically generates
+    the OpenAI tool schema from the function signature and type hints.
+
+    **This is the PREFERRED way to define tools in new skills.**
+
+    **Auto-Generation:**
+    - Tool name: Method name (or override with `name` parameter)
+    - Parameter types: From type hints (required: no default, optional: has default)
+    - Parameter descriptions: From docstring Args section or auto-generated
+    - Tool description: From method docstring (or override with `description` parameter)
+
+    **Requirements:**
+    - Method must have type hints for all parameters (except self)
+    - Method should return a string (the result shown to the LLM)
+    - For async operations, use async def
+
+    **Note:** Don't mix this decorator with legacy get_tools() override in the same skill.
+
+    Args:
+        name: Override the tool name (defaults to function name)
+        description: Override the description (defaults to docstring)
+        summarize: Whether the LLM should summarize after this tool (default True)
+        wait_response: Whether to show a "please wait" message (default False)
+
+    Example:
+        class MySkill(Skill):
+            @tool()
+            def get_weather(self, city: str, units: str = "celsius") -> str:
+                '''Get the current weather for a city.'''
+                return f"Weather in {city}: 22°{units[0].upper()}"
+
+            @tool(name="add_numbers", description="Add two numbers together")
+            def add(self, a: int, b: int) -> int:
+                return a + b
+    """
+
+    def decorator(func: Callable) -> Callable:
+        # Store tool metadata on the function
+        func._tool_definition = ToolDefinition(
+            func=func,
+            name=name,
+            description=description,
+            summarize=summarize,
+            wait_response=wait_response,
+        )
+        return func
+
+    return decorator
+
+
+# Parameter types renderable as static command-action inputs.
+_ALLOWED_COMMAND_ACTION_JSON_TYPES = {"string", "integer", "number", "boolean"}
+
+
+def _validate_command_action_params(func: Callable, schema: dict) -> None:
+    """Raise ValueError if any parameter isn't a UI-renderable scalar / Literal enum."""
+    props = schema.get("function", {}).get("parameters", {}).get("properties", {})
+    for param_name, param_schema in props.items():
+        json_type = param_schema.get("type")
+        if json_type not in _ALLOWED_COMMAND_ACTION_JSON_TYPES:
+            raise ValueError(
+                f"@command_action '{func.__qualname__}': parameter '{param_name}' has "
+                f"unsupported type for a command action (got JSON type '{json_type}'). "
+                f"Allowed: str, int, float, bool, Literal[...]."
+            )
+
+
+# Where a @command_action's return value goes:
+#   "ai"    -> handed to the AI (it voices/uses it, may paraphrase or chain)
+#   "speak" -> spoken verbatim via TTS (and also given to the AI)
+CommandActionRespond = Literal["ai", "speak"]
+
+
+class CommandActionDefinition:
+    """Metadata for a method registered via @command_action."""
+
+    def __init__(
+        self,
+        func: Callable,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        respond: CommandActionRespond = "ai",
+    ):
+        if respond not in ("ai", "speak"):
+            raise ValueError(
+                f"@command_action '{func.__qualname__}': respond must be 'ai' or 'speak', "
+                f"got {respond!r}."
+            )
+        self.func = func
+        self.name = func.__name__
+        self.label = label or func.__name__
+        self.description = description
+        self.respond = respond
+        # UI hint for the command editor: does this action voice a result verbatim?
+        self.speaks = respond == "speak"
+        self.is_async = asyncio.iscoroutinefunction(func)
+        _name, schema = _generate_tool_schema(func, name=self.name, description=description)
+        _validate_command_action_params(func, schema)
+        self.parameters_schema = schema["function"]["parameters"]
+
+    async def execute(self, parameters: dict, skill_instance: "Skill"):
+        # Only pass parameters this function actually declares. Stale/extra keys — e.g. left
+        # over in the command config after switching the selected function in the editor — are
+        # dropped so they can't crash the call with "unexpected keyword argument".
+        allowed = set(self.parameters_schema.get("properties", {}).keys())
+        filtered = {k: v for k, v in (parameters or {}).items() if k in allowed}
+        if self.is_async:
+            return await self.func(skill_instance, **filtered)
+        return self.func(skill_instance, **filtered)
+
+
+def command_action(
+    label: Optional[str] = None,
+    description: Optional[str] = None,
+    respond: CommandActionRespond = "ai",
+):
+    """Decorator: expose a skill method as a user-bindable Command action.
+
+    Distinct from @tool (a function may carry both). Parameters must be scalars
+    (str/int/float/bool) or Literal[...] enums — rendered as static inputs in the command editor.
+
+    Your function returns a plain string (or None); ``respond`` decides where that string goes:
+
+    - ``respond="ai"`` (default): the return is handed to the AI, which voices/uses it (it may
+      paraphrase or chain). Pair with a command's static ``responses`` for a fixed acknowledgment.
+    - ``respond="speak"``: the return is spoken VERBATIM via TTS (no AI roundtrip on instant
+      activation) and also given to the AI. Use for a dynamic, input-dependent spoken reply.
+
+    Returning ``None`` -> the command falls through to its usual "OK" acknowledgment
+    (fire-and-forget), exactly like a keyboard command.
+    """
+
+    def decorator(func: Callable) -> Callable:
+        func._command_action_definition = CommandActionDefinition(
+            func=func, label=label, description=description, respond=respond
+        )
+        return func
+
+    return decorator
+
+
+class Skill:
+    """
+    Base class for all Wingman AI skills.
+
+    DO NOT cache wingman.config or other wingman properties in your skill!
+    Access them when needed using self.wingman.config.property_name.
+
+    Skill API contract (v3):
+        Declare `api_version: 3` in your default_config.yaml manifest.
+        Do NOT perform any work at import / module-load time (no network, no file I/O,
+        no global side effects at module scope). All setup belongs in __init__, validate(),
+        or prepare(). Core import-probes your module during catalog scan without instantiating it.
+
+    Tool Registration:
+        Skills can define tools in two ways:
+
+        1. Legacy pattern (override get_tools and execute_tool):
+            def get_tools(self) -> list[tuple[str, dict]]:
+                return [("my_tool", {...schema...})]
+
+            async def execute_tool(self, tool_name, parameters, benchmark):
+                if tool_name == "my_tool":
+                    return "result", ""
+
+        2. New decorator pattern (recommended):
+            @tool()
+            def my_tool(self, param: str) -> str:
+                '''Tool description from docstring.'''
+                return "result"
+
+            The schema is auto-generated from type hints!
+    """
+
+    def __init__(
+        self,
+        config: SkillConfig,
+        settings: SettingsConfig,
+        wingman: "WingmanContext",
+    ) -> None:
+        self.config = config
+        self.wingman = wingman
+        self.name = self.__class__.__name__
+
+        # Read-only view of app settings; change devices via self.wingman.audio.set_output_device(...)
+        from wingmen.facade import ReadOnlyConfigView
+        self.settings = ReadOnlyConfigView(settings)
+
+        # Private — skills retrieve via self.wingman.secrets.retrieve(...)
+        # Note: secret_events subscription moved to prepare() to avoid listener accumulation
+        self.__secret_keeper = SecretKeeper()
+        self.log = SkillLog(self.name)
+        self.printr = Printr()  # internal/back-compat for base-class logging only
+        self.execution_start: None | float = None
+        """Used for benchmarking executon times. The timer is (re-)started whenever the process function starts."""
+
+        # Lazy validation state
+        self.is_validated: bool = False
+        """Whether validate() has been called and passed."""
+        self.validation_errors: list[WingmanInitializationError] = []
+        """Cached validation errors if validation failed."""
+        self.is_prepared: bool = False
+        """Whether prepare() has been called."""
+        self.is_unloaded: bool = False
+        """Whether unload() has been called. Check this in __del__ before calling unload()."""
+
+        # Collect @tool decorated methods
+        self._decorated_tools: dict[str, ToolDefinition] = {}
+        self._collect_decorated_tools()
+
+        # Tool names the wingman has switched off for this skill. Set by the
+        # skill manager from the wingman's `disabled_skill_tools`; the framework
+        # reads tools through `get_enabled_tools`, so these never reach the model.
+        self.disabled_tools: set[str] = set()
+
+        self._command_actions: dict[str, CommandActionDefinition] = {}
+        self._collect_command_actions()
+
+    def needs_activation(self) -> bool:
+        """Check if this skill still needs validation and preparation.
+
+        Returns True when:
+        - Skill is first loaded (initial state)
+        - After update_config() is called (validation reset)
+        - If validation or preparation previously failed
+
+        Returns False only when both validation and preparation have completed successfully.
+        """
+        return not self.is_validated or not self.is_prepared
+
+    async def update_config(self, new_config: SkillConfig) -> None:
+        """Update the skill's configuration at runtime.
+
+        Called when the user changes skill settings at runtime (e.g., custom properties).
+        By default, this updates self.config and invalidates validation state so the skill
+        will be revalidated on next use.
+
+        **Important:** Skills should NOT cache config values. Instead, retrieve properties
+        just-in-time when needed. This ensures runtime changes take effect immediately.
+        See the validate() method documentation for the recommended pattern.
+
+        Args:
+            new_config: The updated SkillConfig with new custom_properties or prompt.
+        """
+        old_config = self.config
+        self.config = new_config
+
+        # Check if custom_properties actually changed (not just the same object)
+        old_props = {p.id: p.value for p in (old_config.custom_properties or [])}
+        new_props = {p.id: p.value for p in (new_config.custom_properties or [])}
+
+        if old_props != new_props:
+            # Custom properties changed - invalidate validation so skill re-reads config
+            self.is_validated = False
+            self.printr.print(
+                f"Skill '{self.config.display_name}' config updated, will revalidate on next use.",
+                color=LogType.INFO,
+                server_only=True,
+            )
+
+    async def secret_changed(self, secrets: dict[str, any]):
+        """Called when a secret is changed."""
+        pass
+
+    def _collect_decorated_tools(self) -> None:
+        """
+        Collect all methods decorated with @tool and register them.
+        Called during __init__ to auto-discover tools.
+        """
+        for attr_name in dir(self):
+            if attr_name.startswith("_"):
+                continue
+            try:
+                attr = getattr(self, attr_name, None)
+                if attr is None:
+                    continue
+                # Get the underlying function (unwrap bound method)
+                func = getattr(attr, "__func__", attr)
+                if hasattr(func, "_tool_definition"):
+                    tool_def: ToolDefinition = func._tool_definition
+                    self._decorated_tools[tool_def.tool_name] = tool_def
+            except Exception:
+                # Skip attributes that can't be inspected
+                pass
+
+    def _collect_command_actions(self) -> None:
+        """Discover @command_action-decorated methods."""
+        for attr_name in dir(self):
+            if attr_name.startswith("_"):
+                continue
+            try:
+                attr = getattr(self, attr_name, None)
+                if attr is None:
+                    continue
+                func = getattr(attr, "__func__", attr)
+                if hasattr(func, "_command_action_definition"):
+                    cad: CommandActionDefinition = func._command_action_definition
+                    self._command_actions[cad.name] = cad
+            except Exception:
+                pass
+
+    async def validate(self) -> list[WingmanInitializationError]:
+        """
+        Validates the skill configuration at startup and reload.
+
+        This method should:
+        1. Call retrieve_custom_property_value() for all custom properties to validate they exist
+           and are properly configured. This reports errors for missing or invalid properties.
+        2. Perform any initialization that requires the properties (e.g., provider setup).
+        3. NOT cache property values in instance variables for runtime use.
+
+        Property values should be retrieved fresh at runtime using helper methods that call
+        retrieve_custom_property_value() just-in-time. This ensures changes made in the UI
+        are immediately reflected without requiring skill reactivation.
+
+        Example pattern:
+            async def validate(self):
+                errors = await super().validate()
+                # Validate properties exist (don't cache)
+                self.retrieve_custom_property_value("audio_config", errors)
+                self.retrieve_custom_property_value("volume", errors)
+                return errors
+
+            def _get_audio_config(self):
+                # Retrieve fresh at runtime
+                errors = []
+                return self.retrieve_custom_property_value("audio_config", errors)
+
+        Returns:
+            List of initialization errors found during validation.
+        """
+        return []
+
+    async def ensure_activated(self) -> tuple[bool, str]:
+        """
+        Ensure the skill is validated and prepared for use.
+        Called lazily on first activation via SkillRegistry.
+
+        Returns:
+            (success, message) tuple
+        """
+        import asyncio
+
+        # Already validated and prepared?
+        if self.is_validated and self.is_prepared:
+            return True, f"Skill '{self.config.display_name}' is ready."
+
+        # Run validation if not done yet
+        if not self.is_validated:
+            self.validation_errors = await self.validate()
+
+            # Handle missing secrets with retry
+            if any(e.error_type == "missing_secret" for e in self.validation_errors):
+                for _attempt in range(2):
+                    await asyncio.sleep(5)
+                    self.validation_errors = await self.validate()
+                    if not self.validation_errors:
+                        break
+
+            if self.validation_errors:
+                error_msgs = "; ".join(e.message for e in self.validation_errors)
+                return (
+                    False,
+                    f"Skill '{self.config.display_name}' validation failed: {error_msgs}",
+                )
+
+            self.is_validated = True
+
+        # Run prepare if not done yet
+        if not self.is_prepared:
+            await self.prepare()
+            self.is_prepared = True
+            self.printr.print(
+                f"Skill '{self.config.name}' validated and prepared.",
+                color=LogType.POSITIVE,
+                server_only=True,
+            )
+
+        return True, f"Skill '{self.config.display_name}' activated successfully."
+
+    async def unload(self) -> None:
+        """Unload the skill. Use this hook to clear background tasks, etc.
+
+        This is always called when a skill is removed, regardless of whether
+        prepare() was ever called. Safe to call multiple times.
+
+        Custom skills with __del__ should check self.is_unloaded before calling unload():
+            def __del__(self):
+                if not self.is_unloaded:
+                    # handle cleanup synchronously, don't use asyncio.run()
+        """
+        if self.is_unloaded:
+            return  # Already unloaded, skip
+
+        self.is_unloaded = True
+
+        # Safely unsubscribe - the handler may not be subscribed if prepare() was never called
+        try:
+            self.__secret_keeper.secret_events.unsubscribe(
+                "secrets_saved", self.secret_changed
+            )
+        except ValueError:
+            # Handler wasn't subscribed, that's fine
+            pass
+
+    async def prepare(self) -> None:
+        """Prepare the skill. Use this hook to initialize background tasks, etc.
+
+        Called once when the skill is first activated (lazy initialization).
+        Subscribe to events here, not in __init__.
+        """
+        # Subscribe to secret changes - will be unsubscribed in unload()
+        self.__secret_keeper.secret_events.subscribe("secrets_saved", self.secret_changed)
+
+    def get_tools(self) -> list[tuple[str, dict]]:
+        """
+        Returns a list of tools available in the skill.
+
+        .. deprecated::
+            Use the @tool decorator instead. This method is maintained for backward
+            compatibility with existing skills but will be removed in a future version.
+
+        **For new skills:** Use the @tool decorator instead of overriding this method.
+        The @tool decorator provides automatic schema generation and cleaner code.
+
+        **Legacy pattern (for compatibility only):**
+        Override this method to manually provide tools. By default, returns tools from
+        @tool decorated methods.
+
+        **Migration guidance:**
+        - New skills: Use @tool decorator exclusively, don't override this method
+        - Existing skills: Can continue using this pattern or migrate to @tool decorator
+        - Mixed approach: NOT recommended - choose one pattern per skill
+
+        Returns:
+            List of (tool_name, tool_definition) tuples
+        """
+        # Only warn if get_tools is overridden in a subclass
+        if type(self).get_tools is not Skill.get_tools:
+            warnings.warn(
+                "get_tools() is deprecated. Use the @tool decorator instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        # Return tools from @tool decorated methods
+        tools = []
+        for tool_def in self._decorated_tools.values():
+            tools.append((tool_def.tool_name, tool_def.tool_schema))
+        return tools
+
+    def get_enabled_tools(self) -> list[tuple[str, dict]]:
+        """The skill's tools minus the ones the wingman switched off.
+
+        This is what the framework registers and hands to the model. `get_tools`
+        stays the full list, so the UI can show every tool with its switch.
+        """
+        if not self.disabled_tools:
+            return self.get_tools()
+        return [
+            (name, schema)
+            for name, schema in self.get_tools()
+            if name not in self.disabled_tools
+        ]
+
+    def get_tools_description(self) -> str:
+        """
+        Auto-generate a prompt section describing all tools in this skill.
+
+        This is used for progressive disclosure - the ToolRegistry includes
+        these descriptions in skill manifests so the LLM can search for
+        relevant skills without loading all tool definitions upfront.
+
+        Returns:
+            A formatted string listing all tools and their descriptions.
+        """
+        tools = self.get_enabled_tools()
+        if not tools:
+            return ""
+
+        lines = []
+        for tool_name, tool_def in tools:
+            # Extract description from tool definition
+            if isinstance(tool_def, dict):
+                func_def = tool_def.get("function", tool_def)
+                desc = func_def.get("description", "No description")
+                # Use first line only for brevity
+                desc = desc.split("\n")[0].strip()
+                lines.append(f"- {tool_name}: {desc}")
+            else:
+                lines.append(f"- {tool_name}: No description")
+
+        return "\n".join(lines)
+
+    async def get_prompt(self) -> str | None:
+        """
+        Returns additional context for this skill.
+
+        By default, returns the config.prompt if set. Skills with @tool decorated
+        methods will have their tool descriptions auto-generated by the ToolRegistry
+        for progressive disclosure, so explicit prompts are optional.
+
+        Override this method to add dynamic data to context.
+        """
+        return self.config.prompt or None
+
+    async def execute_command_action(
+        self, function_name: str, parameters: dict
+    ) -> tuple[str, str]:
+        """Execute a @command_action by name. Returns (function_response, instant_response).
+
+        Routing depends on the action's ``respond`` mode:
+        - ``respond="ai"``    -> the return goes to the AI (function_response); nothing spoken verbatim.
+        - ``respond="speak"`` -> the return is spoken verbatim (instant_response) AND given to the AI.
+
+        Returning ``None`` -> ('', '') so the command falls through to its usual "OK"
+        acknowledgment. Returns ('', '') if the function name is unknown.
+        """
+        cad = self._command_actions.get(function_name)
+        if not cad:
+            return "", ""
+        result = await cad.execute(parameters or {}, self)
+        if result is None:
+            return "", ""
+        text = str(result)
+        if cad.respond == "speak":
+            return text, text  # spoken verbatim + the AI is told what was said
+        return text, ""        # respond="ai": hand it to the AI
+
+    def list_command_actions(self) -> list[dict]:
+        """Describe this skill's command-actions for the client editor."""
+        return [
+            {
+                "skill_name": self.name,
+                "function_name": cad.name,
+                "label": cad.label,
+                "description": cad.description,
+                "speaks": cad.speaks,
+                "parameters_schema": cad.parameters_schema,
+            }
+            for cad in self._command_actions.values()
+        ]
+
+    async def execute_tool(
+        self, tool_name: str, parameters: dict[str, any], benchmark: Benchmark
+    ) -> tuple[str, str]:
+        """
+        Execute a tool by name with parameters.
+
+        By default, handles tools registered via @tool decorator.
+        Override this method for the legacy pattern or to add custom logic.
+
+        Args:
+            tool_name: Name of the tool to execute
+            parameters: Dictionary of parameters passed by the LLM
+            benchmark: Benchmark instance for timing
+
+        Returns:
+            Tuple of (function_response, instant_response)
+            - function_response: Text result to return to the LLM
+            - instant_response: Optional text to speak immediately
+        """
+        # Check if this is a @tool decorated method
+        if tool_name in self._decorated_tools:
+            tool_def = self._decorated_tools[tool_name]
+            benchmark.start_snapshot(f"{self.name}: {tool_name}")
+
+            try:
+                result = await tool_def.execute(parameters, self)
+
+                # Support tuple returns for (function_response, instant_response)
+                if isinstance(result, tuple) and len(result) == 2:
+                    func_response, instant_response = result
+                    if func_response is None:
+                        func_response = ""
+                    elif not isinstance(func_response, str):
+                        func_response = str(func_response)
+                    if instant_response is None:
+                        instant_response = ""
+                    elif not isinstance(instant_response, str):
+                        instant_response = str(instant_response)
+                    return func_response, instant_response
+
+                # Convert single result to string
+                if result is None:
+                    result = ""
+                elif not isinstance(result, str):
+                    result = str(result)
+
+                return result, ""
+            finally:
+                benchmark.finish_snapshot()
+
+        # No matching tool found
+        return "", ""
+
+    async def on_add_user_message(self, message: str) -> None:
+        """Called when a user message is added to the system."""
+        pass
+
+    async def on_add_assistant_message(self, message: str, tool_calls: list) -> None:
+        """Called when an assistant message is added to the conversation."""
+        pass
+
+    async def on_play_to_user(self, text: str, sound_config: SoundConfig) -> str:
+        """Called before the text is synthetized to speech by the TTS provider.
+        You can modify the text if needed. Add {SKIP-TTS} to the text to to skip playback.
+        """
+        return text
+
+    async def is_summarize_needed(self, tool_name: str) -> bool:
+        """Returns whether a tool needs to be summarized."""
+        # Check @tool decorator setting
+        if tool_name in self._decorated_tools:
+            return self._decorated_tools[tool_name].summarize
+        return True
+
+    async def is_waiting_response_needed(self, tool_name: str) -> bool:
+        """Returns whether a tool probably takes long and a message should be printed in between."""
+        # Check @tool decorator setting
+        if tool_name in self._decorated_tools:
+            return self._decorated_tools[tool_name].wait_response
+        return False
+
+    def retrieve_custom_property_value(
+        self,
+        property_id: str,
+        errors: list[WingmanInitializationError],
+        hint: str = None,
+    ):
+        """Use this method to retrieve custom properties from the Skill config."""
+        p = next(
+            (prop for prop in self.config.custom_properties if prop.id == property_id),
+            None,
+        )
+        if p is None or (p.required and p.value is None):
+            errors.append(
+                WingmanInitializationError(
+                    wingman_name=self.name,
+                    message=f"Missing custom property '{property_id}'. {hint}",
+                    error_type=WingmanInitializationErrorType.INVALID_CONFIG,
+                )
+            )
+            return None
+        return p.value
+
+    def get_generated_files_dir(self) -> str:
+        """Get the path to this skill's generated files directory.
+
+        Returns the absolute path to a directory where this skill can store generated files.
+        The directory is automatically created if it doesn't exist and persists across
+        Wingman AI updates (not versioned).
+
+        Example paths:
+        - macOS: /Users/username/Library/Application Support/WingmanAI/generated_files/AutoScreenshot
+        - Windows: C:\\Users\\username\\AppData\\Roaming\\ShipBit\\WingmanAI\\generated_files\\AutoScreenshot
+
+        Returns:
+            The absolute path to this skill's generated files directory
+        """
+        from services.file import get_generated_files_dir
+
+        return get_generated_files_dir(self.name)

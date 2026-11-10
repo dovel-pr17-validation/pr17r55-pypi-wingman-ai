@@ -1,0 +1,760 @@
+import json
+import asyncio
+from fastapi import WebSocket
+import keyboard.keyboard as keyboard
+from api.commands import (
+    ActionsRecordedCommand,
+    ClientLoggedOutCommand,
+    CoreStateChangedCommand,
+    RecordJoystickActionsCommand,
+    RecordKeyboardActionsCommand,
+    RecordMouseActionsCommand,
+    SaveSecretCommand,
+    SubscriptionTokenSavedCommand,
+    StopRecordingCommand,
+    WebSocketCommandModel,
+    ClientLoggedInCommand,
+)
+from api.enums import CoreState, KeyboardRecordingType, LogSource, LogType, RecordingDevice, ToastType
+from api.interface import (
+    CommandActionConfig,
+    CommandJoystickConfig,
+    CommandKeyboardConfig,
+    CommandMouseConfig,
+    ConfigWithDirInfo,
+    InputBinding,
+    KeyStroke,
+)
+from mouse import mouse
+from services import error_reporting
+from services import input_bindings
+from services.connection_manager import ConnectionManager
+from services.printr import Printr
+from services.secret_keeper import SecretKeeper
+from services.websocket_user import WebSocketUser
+from wingman_core import WingmanCore
+
+
+PICKABLE_KEYS = {"esc", *(f"f{n}" for n in range(1, 25))}
+"""Keys the recorder offers as buttons because pressing them does not work:
+Esc ends the recording, the F keys are taken by the app or the system."""
+
+
+class CommandHandler:
+    def __init__(self, connection_manager: ConnectionManager, core: WingmanCore):
+        self.source_name = "WebSocket Command Handler"
+        self.connection_manager = connection_manager
+        self.core = core
+        self.secret_keeper: SecretKeeper = SecretKeeper()
+        self.printr: Printr = Printr()
+        self.timeout_task = None
+        self.recorded_keys = []
+        # Keyboard keys held with a recorded mouse or joystick button.
+        self._recorded_modifiers: list[KeyStroke] = []
+        self.keyboard_hook_callback = None
+        # Recording twice must not hook twice, a stop from the client after
+        # the click already stopped must not unhook twice.
+        self._mouse_hooked = False
+        self.is_joystick_recording = False
+
+    async def dispatch(self, message, websocket: WebSocket):
+        try:
+            command: WebSocketCommandModel = json.loads(message)
+            command_name = command["command"]
+
+            if command_name == "client_ready":
+                await self.handle_client_ready(websocket)
+            elif command_name == "save_secret":
+                await self.handle_secret(SaveSecretCommand(**command), websocket)
+            elif command_name == "record_keyboard_actions":
+                await self.handle_record_keyboard_actions(
+                    RecordKeyboardActionsCommand(**command), websocket
+                )
+            elif command_name == "record_mouse_actions":
+                await self.handle_record_mouse_actions(
+                    RecordMouseActionsCommand(**command), websocket
+                )
+            elif command_name == "record_joystick_actions":
+                # Run as background task so the websocket loop stays responsive
+                # and can still process stop_recording commands.
+                asyncio.ensure_future(
+                    self.handle_record_joystick_actions(
+                        RecordJoystickActionsCommand(**command), websocket
+                    )
+                )
+            elif command_name == "stop_recording":
+                await self.handle_stop_recording(
+                    StopRecordingCommand(**command), websocket
+                )
+            elif command_name == "client_logged_in":
+                await self.handle_client_logged_in(
+                    ClientLoggedInCommand(**command), websocket
+                )
+            elif command_name == "client_logged_out":
+                await self.handle_client_logged_out(
+                    ClientLoggedOutCommand(**command), websocket
+                )
+            else:
+                raise ValueError("Unknown command")
+        except Exception as e:
+            await self.printr.print_async(
+                f"Error executing command {command_name}: {str(e)}",
+                toast=ToastType.ERROR,
+                source=LogSource.SYSTEM,
+                source_name=self.source_name,
+            )
+
+    async def handle_client_ready(self, websocket: WebSocket):
+        await self.connection_manager.client_ready(websocket)
+
+        # Send current core state so late-connecting clients get the right status
+        # (core_state_changed is not queued when no clients are connected)
+        state_command = CoreStateChangedCommand(
+            state=self.core.core_state,
+            message=self.core.core_state_message,
+            progress=self.core.core_state_progress,
+        )
+        await self.connection_manager.send_to(state_command, websocket)
+
+    # todo: make this a POST request - was just a demo for commands with params
+    async def handle_secret(self, command: SaveSecretCommand, websocket: WebSocket):
+        secret_name = command.secret_name
+        secret_value = command.secret_value
+        # The client sends its device token again on every start, without a
+        # message. Saving it would make every Wingman validate again for
+        # nothing. A user retrying a failed Wingman comes with a message.
+        unchanged = self.secret_keeper.secrets.get(secret_name) == secret_value
+        if not unchanged or command.show_message:
+            self.secret_keeper.secrets[secret_name] = secret_value
+            await self.secret_keeper.save()
+        if secret_name == "wingman_pro":
+            await self.connection_manager.broadcast(SubscriptionTokenSavedCommand())
+
+        if command.show_message:
+            await self.printr.print_async(
+                f"Secret '{secret_name}' saved",
+                toast=ToastType.NORMAL,
+                source=LogSource.SYSTEM,
+                source_name=self.source_name,
+            )
+
+    def _is_hotkey_recording_finished(self, recorded_keys):
+        # Check if for all down events there is a corresponding up event
+        for key in recorded_keys:
+            if key.event_type == "down":
+                key_up_event = next(
+                    (
+                        k
+                        for k in recorded_keys
+                        if k.event_type == "up" and k.scan_code == key.scan_code
+                    ),
+                    None,
+                )
+                if not key_up_event:
+                    return False
+        return True
+
+    def _held_strokes(self) -> list[KeyStroke]:
+        """The keyboard keys held right now, for a mouse or joystick binding
+        like Ctrl + Mouse 4."""
+        return [
+            input_bindings.stroke_from_event(event)
+            for event in list(self.core.key_events.values())
+        ]
+
+    def on_mouse(self, event):
+        # Check if event is of type ButtonEvent
+        if not isinstance(event, mouse.ButtonEvent):
+            return
+
+        if event.event_type == "down":
+            # Taken on the way down: the keys may be let go before the button.
+            self._recorded_modifiers = self._held_strokes()
+
+        if event.event_type == "up":
+            self.recorded_keys.append(event)
+
+            stop_command = StopRecordingCommand(
+                command="stop_recording", recording_device=RecordingDevice.MOUSE
+            )
+
+            WebSocketUser.ensure_async(self.handle_stop_recording(stop_command, None))
+
+    async def handle_record_mouse_actions(
+        self, command: RecordMouseActionsCommand, websocket: WebSocket
+    ):
+        await self.printr.print_async(
+            "Recording mouse actions...",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+        self.recorded_keys = []
+        self._recorded_modifiers = []
+        if not self._mouse_hooked:
+            mouse.hook(self.on_mouse)
+            self._mouse_hooked = True
+
+    async def handle_record_joystick_actions(
+        self, command: RecordJoystickActionsCommand, websocket: WebSocket
+    ):
+        await self.printr.print_async(
+            "Recording joystick actions...",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+        self.recorded_keys = []
+        self.is_joystick_recording = True
+        self.core._joystick_recording_held = []
+        result = await self.core.record_joystick_action()
+        if result and self.is_joystick_recording:
+            self.recorded_keys.append(result)
+            held = self.core._joystick_recording_held or list(self.core.key_events.values())
+            self.core._joystick_recording_held = []
+            self._recorded_modifiers = [input_bindings.stroke_from_event(e) for e in held]
+
+        stop_command = StopRecordingCommand(
+            command="stop_recording", recording_device=RecordingDevice.JOYSTICK
+        )
+
+        await self.handle_stop_recording(stop_command, None)
+
+    async def handle_record_keyboard_actions(
+        self, command: RecordKeyboardActionsCommand, websocket: WebSocket
+    ):
+        await self.printr.print_async(
+            "Recording keyboard actions...",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+        # Start timeout
+        # self.timeout_task = WebSocketUser.ensure_async(self._start_timeout(10))
+        self.recorded_keys = []
+
+        stop_command = StopRecordingCommand(
+            command="stop_recording",
+            recording_device=RecordingDevice.KEYBOARD,
+            recording_type=command.recording_type,
+        )
+
+        def _on_key_event(event):
+            if event.event_type == "down" and event.name == "esc":
+                WebSocketUser.ensure_async(
+                    self.handle_stop_recording(stop_command, websocket)
+                )
+            if (
+                event.scan_code == 58
+                or event.scan_code == 70
+                or (event.scan_code == 69 and event.is_extended)
+            ):
+                # let capslock, numlock or scrolllock through, as it changes following keypresses
+                keyboard.direct_event(
+                    event.scan_code,
+                    (0 if event.event_type == "down" else 2) + int(bool(event.is_extended)),
+                )
+
+            self.recorded_keys.append(event)
+            if (
+                command.recording_type == KeyboardRecordingType.SINGLE
+                and self._is_hotkey_recording_finished(self.recorded_keys)
+            ):
+                WebSocketUser.ensure_async(
+                    self.handle_stop_recording(stop_command, websocket)
+                )
+
+        self.keyboard_hook_callback = keyboard.hook(_on_key_event, suppress=True)
+
+    async def handle_stop_recording(
+        self,
+        command: StopRecordingCommand,
+        websocket: WebSocket,
+    ):
+        if self.keyboard_hook_callback:
+            keyboard.unhook(self.keyboard_hook_callback)
+            self.keyboard_hook_callback = None
+            # While the recorder suppressed the keyboard, Core saw no key-ups.
+            # A key let go then would stay "held" and its next press would be
+            # taken for an auto-repeat and ignored.
+            self.core.key_events.clear()
+        if command.recording_device == RecordingDevice.JOYSTICK:
+            self.is_joystick_recording = False
+            self.core.cancel_joystick_recording()
+        if command.recording_device == RecordingDevice.MOUSE and self._mouse_hooked:
+            mouse.unhook(self.on_mouse)
+            self._mouse_hooked = False
+
+        recorded_keys = self.recorded_keys
+        if self.timeout_task:
+            self.timeout_task.cancel()
+
+        actions: list[CommandActionConfig] = []
+        picked = (command.add_key or "").lower()
+        if picked not in PICKABLE_KEYS:
+            picked = ""
+
+        if command.recording_device == RecordingDevice.KEYBOARD and picked:
+            # Picked from a button: kept by name, which every OS resolves.
+            key_action = CommandActionConfig(
+                keyboard=CommandKeyboardConfig(
+                    hotkey=picked,
+                    keys=[KeyStroke(scan_code=None, extended=False, name=picked)],
+                )
+            )
+            if command.recording_type == KeyboardRecordingType.SINGLE:
+                actions = [key_action]
+            else:
+                actions = [
+                    *(
+                        self._get_actions_from_recorded_keys(recorded_keys)
+                        if command.recording_type == KeyboardRecordingType.MACRO_ADVANCED
+                        else self._get_actions_from_recorded_hotkey(recorded_keys)
+                    ),
+                    key_action,
+                ]
+        elif command.recording_device == RecordingDevice.KEYBOARD:
+            actions = (
+                self._get_actions_from_recorded_keys(recorded_keys)
+                if command.recording_type == KeyboardRecordingType.MACRO_ADVANCED
+                else self._get_actions_from_recorded_hotkey(recorded_keys)
+            )
+        elif command.recording_device == RecordingDevice.JOYSTICK:
+            if len(recorded_keys) > 0:
+                joystick_config = CommandActionConfig()
+                joystick_config.joystick = CommandJoystickConfig()
+                joystick_config.joystick.button = recorded_keys[0]["button"]
+                joystick_config.joystick.name = recorded_keys[0]["name"]
+                joystick_config.joystick.guid = recorded_keys[0]["guid"]
+                actions.append(joystick_config)
+        elif command.recording_device == RecordingDevice.MOUSE:
+            if len(recorded_keys) > 0:
+                mouse_config = CommandActionConfig()
+                mouse_config.mouse = CommandMouseConfig()
+                mouse_config.mouse.button = recorded_keys[0].button
+                actions.append(mouse_config)
+
+        binding = None
+        if command.recording_type == KeyboardRecordingType.SINGLE and actions:
+            binding = self._binding_from_action(
+                actions[0], self._recorded_modifiers
+            )
+        self._recorded_modifiers = []
+
+        command = ActionsRecordedCommand(
+            command="actions_recorded", actions=actions, binding=binding
+        )
+        await self.connection_manager.broadcast(command)
+
+        self.recorded_keys = []
+
+        await self.printr.print_async(
+            "Stopped recording actions.",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+    async def handle_client_logged_in(
+        self, command: ClientLoggedInCommand, websocket: WebSocket
+    ):
+        # Before the early return: a second account signing in on the same
+        # machine arrives as a keepalive too.
+        error_reporting.set_user(command.user_id)
+
+        if self.core.is_client_logged_in:
+            # keepalive / token refresh, but the Tower is already initialized
+            return
+
+        # Wait until config is loaded before proceeding — the server now starts
+        # before startup completes, so this command may arrive early.
+        while self.core.core_state in (
+            CoreState.STARTING,
+            CoreState.MIGRATING,
+            CoreState.LOADING_CONFIG,
+        ):
+            await asyncio.sleep(0.1)
+
+        self.core.is_client_logged_in = True
+        self.core.client_plan = command.plan
+        self.core.client_account_name = command.account_name
+
+        # Store username in settings for wingman access
+        self.core.config_manager.settings_config.user_name = command.account_name
+        # ...and into the speech vocabulary, so the wingmen spell it right
+        self.core.settings_service.seed_vocabulary()
+
+        self.printr.print(
+            f"User {command.account_name} logged in ({command.plan})",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+        downgraded = await self._downgrade_subscription_tts()
+        rewritten = await self._rewrite_locked_voices()
+        if downgraded or rewritten:
+            # Reloading publishes config_loaded, which initializes the Tower
+            # with the rewritten configs.
+            await self.core.config_service.load_config(
+                self.core.config_service.current_config_dir
+            )
+            return
+
+        config_dir_info = ConfigWithDirInfo(
+            config=self.core.config_service.current_config,
+            config_dir=self.core.config_service.current_config_dir,
+        )
+        await self.core.initialize_tower(config_dir_info)
+
+    async def _downgrade_subscription_tts(self) -> bool:
+        """A plan without Inworld (Free) speaks with Azure: Wingmen set to the
+        subscription's Inworld move there, with a voice of the same gender.
+        Whether the plan has Inworld comes from the backend's model list, not
+        the plan name. No answer from the backend: nothing changes."""
+        from services.wingman_default_voices import downgrade_inworld_to_azure
+
+        tts = await self.core.get_wingman_tts_models()
+        if not tts.models or any(
+            m.provider == "inworld" and m.available for m in tts.models
+        ):
+            return False
+        changed = downgrade_inworld_to_azure(self.core.config_manager)
+        if not changed:
+            return False
+        await self.printr.print_async(
+            "Your plan has no Inworld voices, so these Wingmen now speak with Azure: "
+            + ", ".join(changed),
+            color=LogType.INFO,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+        )
+        return True
+
+    async def _fetch_plan_voices(self) -> dict[str, list]:
+        """The subscription's Azure and Inworld voices, `locked` where the plan
+        does not include them. A provider whose list could not be fetched maps
+        to an empty list, which means "leave it alone"."""
+        from providers.wingman_subscription import WingmanSubscription
+
+        # A short timeout: this runs on sign-in, before the Tower starts.
+        subscription = WingmanSubscription(
+            wingman_name="",
+            settings=self.core.config_manager.settings_config.wingman_pro,
+            timeout=10,
+        )
+
+        async def fetch(provider: str, load) -> list:
+            try:
+                return await asyncio.to_thread(load) or []
+            except Exception as e:
+                self.printr.print(
+                    f"Could not fetch the plan's {provider} voices: {e}",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+                return []
+
+        azure, inworld = await asyncio.gather(
+            fetch("azure", subscription.get_available_azure_voices),
+            fetch("inworld", subscription.get_available_inworld_voices),
+        )
+        return {"azure": azure, "inworld": inworld}
+
+    async def _rewrite_locked_voices(self) -> bool:
+        """A Wingman set to a subscription voice its plan does not include gets
+        the closest free voice in its config, so the config says what the
+        backend really plays. Returns True when a config changed."""
+        from services.wingman_default_voices import rewrite_locked_voices
+
+        try:
+            voices = await self._fetch_plan_voices()
+            changed = rewrite_locked_voices(self.core.config_manager, voices)
+        except Exception as e:
+            self.printr.print(
+                f"Could not replace locked voices: {e}",
+                color=LogType.WARNING,
+                server_only=True,
+            )
+            return False
+        if not changed:
+            return False
+        await self.printr.print_async(
+            "These voices are not in your plan, so the Wingmen now use free ones: "
+            + ", ".join(changed),
+            color=LogType.INFO,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+        )
+        return True
+
+    async def handle_client_logged_out(
+        self, command: ClientLoggedOutCommand, websocket: WebSocket
+    ):
+        # Read the name before clearing it, so the log line says who left.
+        name = self.core.client_account_name
+        self.core.is_client_logged_in = False
+        error_reporting.set_user(None)
+        self.core.client_plan = "Free"
+        self.core.client_account_name = ""
+
+        # Clear username from settings
+        self.core.config_manager.settings_config.user_name = None
+
+        self.printr.print(
+            f"User {name or 'unknown'} logged out",
+            toast=ToastType.NORMAL,
+            source=LogSource.SYSTEM,
+            source_name=self.source_name,
+            server_only=True,
+        )
+
+    async def _start_timeout(self, timeout):
+        await asyncio.sleep(timeout)
+        await self.handle_stop_recording(None, None)
+
+    @staticmethod
+    def _binding_from_action(
+        action: CommandActionConfig, modifiers: list[KeyStroke]
+    ) -> InputBinding | None:
+        if action.keyboard and action.keyboard.keys:
+            return InputBinding(
+                device=RecordingDevice.KEYBOARD, keys=action.keyboard.keys
+            )
+        if action.mouse and action.mouse.button:
+            return InputBinding(
+                device=RecordingDevice.MOUSE,
+                keys=modifiers,
+                mouse_button=action.mouse.button,
+            )
+        if action.joystick and action.joystick.guid:
+            return InputBinding(
+                device=RecordingDevice.JOYSTICK, keys=modifiers, joystick=action.joystick
+            )
+        return None
+
+    def _get_actions_from_recorded_keys(self, recorded, compressed=False):
+        actions: list[CommandActionConfig] = []
+
+        def add_action(name, code, extended, press, release, hold):
+            if press or release:
+                hold = None  # reduces yaml size
+            else:
+                hold = round(hold, 2)
+                if hold < 0.1:
+                    hold = 0.1  # 100ms min hold time
+                else:
+                    hold = round(round(hold / 0.05) * 0.05, 3)
+
+            if not extended:
+                extended = None  # reduces yaml size
+
+            # add keyboard action
+            actions.append(
+                CommandActionConfig(
+                    keyboard=CommandKeyboardConfig(
+                        hotkey=name,
+                        hotkey_codes=[code],
+                        hotkey_extended=extended,
+                        press=press,
+                        release=release,
+                        hold=hold,
+                    )
+                )
+            )
+
+        def add_wait(duration):
+            if not duration:
+                return
+            duration = round(duration, 2)
+            if duration < 0.05:
+                duration = 0.05  # 50ms min wait time
+            else:
+                duration = round(round(duration / 0.05) * 0.05, 3)
+            actions.append(CommandActionConfig(wait=duration))
+
+        last_last_key_data = []
+        last_key_data = []
+        key_data = []
+
+        # Process recorded key events to calculate press durations and wait times
+        # We are trying to compress press and release events into one action.
+        # This reduces the amount of actions and increases readability of yaml files.
+        # Tradeoff is a bit confusing logic below.
+        for key in recorded:
+            key_data = [
+                key.name.lower(),
+                key.scan_code,
+                bool(key.is_extended),
+                key.event_type,
+                key.time,
+                0,
+            ]
+
+            if last_key_data:
+                if (
+                    key_data[1] == last_key_data[1]
+                    and key_data[2] == last_key_data[2]
+                    and key_data[3] == last_key_data[3]
+                ):
+                    # skip double actions
+                    continue
+                key_data[5] = key_data[4] - last_key_data[4]  # set time diff
+
+            # check if last key was down event
+            if last_key_data and last_key_data[3] == "down":
+                # same key?
+                if compressed and key_data[1] == last_key_data[1] and key_data[2] == last_key_data[2]:
+                    # write as compressed action
+                    add_wait(last_key_data[5])
+                    add_action(
+                        key_data[0], key_data[1], key_data[2], None, None, key_data[5]
+                    )
+                else:
+                    # write as separate action
+                    add_wait(last_key_data[5])
+                    add_action(
+                        last_key_data[0],
+                        last_key_data[1],
+                        last_key_data[2],
+                        True,
+                        None,
+                        0,
+                    )
+
+            if last_key_data and last_key_data[3] == "up":
+                if (
+                    last_last_key_data
+                    and (
+                        not compressed
+                        or (
+                            last_last_key_data[1] != last_key_data[1]
+                            or last_last_key_data[2] != last_key_data[2]
+                        )
+                    )
+                ):
+                    add_wait(last_key_data[5])
+                    add_action(
+                        last_key_data[0],
+                        last_key_data[1],
+                        last_key_data[2],
+                        None,
+                        True,
+                        0,
+                    )
+
+            last_last_key_data = last_key_data
+            last_key_data = key_data
+
+        # add last action
+        if key_data and key_data[3] == "down":
+            add_wait(key_data[5])
+            add_action(key_data[0], key_data[1], key_data[2], True, None, 0)
+        elif (
+            key_data
+            and last_key_data
+            and last_last_key_data
+            and key_data[3] == "up"
+            and (
+                not compressed
+                or (
+                    last_last_key_data[1] != last_key_data[1]
+                    or last_last_key_data[2] != last_key_data[2]
+                )
+            )
+        ):
+            add_wait(key_data[5])
+            add_action(key_data[0], key_data[1], key_data[2], None, True, 0)
+
+        return actions
+
+    def _get_actions_from_recorded_hotkey(self, recorded):
+        # used for single key recording and simple macros
+        actions: list[CommandActionConfig] = []
+
+        key_down_time = {}  # Track initial down times for keys
+        last_up_time = None  # Track the last up time to measure durations of inactivity
+
+        # Track the keys currently pressed in the order they were pressed
+        keys_pressed = []
+        # Initialize such that we consider the keyboard initially inactive
+        all_keys_released = True
+
+        # Process recorded key events to calculate press durations and inactivity
+        for key in recorded:
+            key_name = key.name.lower()
+            # Right Ctrl and left Ctrl share a scan code; the flag tells them apart.
+            key_code = input_bindings.held_key(key)
+            if key.event_type == "down":
+                # Ignore further processing if 'esc' was pressed
+                if key_name == "esc":
+                    break
+
+                if all_keys_released:
+                    # There was a period of inactivity, calculate its duration
+                    if last_up_time is not None:
+                        inactivity_duration = key.time - last_up_time
+                        if inactivity_duration > 1.0:
+                            wait_config = CommandActionConfig()
+                            wait_config.wait = round(inactivity_duration, 2)
+                            actions.append(wait_config)
+
+                    all_keys_released = False
+
+                # Record only the first down event time for each key and add to keys_pressed
+                if key_code not in key_down_time:
+                    key_down_time[key_code] = key.time
+                    # Add key to keys_pressed when pressed down
+                    keys_pressed.append(key)
+
+            elif key.event_type == "up":
+                if key_name == "esc":
+                    break  # Stop processing if 'esc' was released as we don't need the last inactivity period
+
+                if key_code in key_down_time:
+                    # Calculate the press duration for the current key
+                    press_duration = key.time - key_down_time[key_code]
+
+                    # Remove the key from the dictionary after calculating press duration
+                    del key_down_time[key_code]
+
+                    # If no more keys are pressed, update last_up_time and set the keyboard to inactive
+                    if not key_down_time:
+                        last_up_time = key.time
+                        all_keys_released = True
+
+                        hotkey_name = "+".join(key.name.lower() for key in keys_pressed)
+
+                        key_config = CommandActionConfig()
+                        key_config.keyboard = CommandKeyboardConfig(hotkey=hotkey_name)
+                        key_config.keyboard.hotkey_codes = [
+                            key.scan_code for key in keys_pressed
+                        ]
+                        # One flag per key. The single flag stays for a
+                        # combination whose keys agree, as older Cores read it.
+                        strokes = [
+                            input_bindings.stroke_from_event(key) for key in keys_pressed
+                        ]
+                        key_config.keyboard.keys = strokes
+                        flags = {stroke.extended for stroke in strokes}
+                        key_config.keyboard.hotkey_extended = (
+                            flags.pop() if len(flags) == 1 else None
+                        )
+
+                        if press_duration > 0.2 and len(keys_pressed) == 1:
+                            key_config.keyboard.hold = round(press_duration, 2)
+
+                        keys_pressed = (
+                            []
+                        )  # Clear keys_pressed after getting the hotkey_name
+                        actions.append(key_config)
+
+        return actions

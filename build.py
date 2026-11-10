@@ -1,0 +1,36 @@
+import os
+import subprocess
+
+cmd = [
+    "python",
+    "-m",
+    "PyInstaller",
+    "main.py",  # your main file with ui.run()
+    "--name",
+    "WingmanAiCore",  # name of your app
+    # "--onefile",
+    # "--windowed",  # prevent console appearing, only use with ui.run(native=True, ...)
+    "--icon",
+    "assets/wingman-ai.ico",
+    "--noconfirm",
+    "--paths",
+    "venv/Lib/site-packages",
+    "--add-data",
+    "--add-data",
+    f"assets{os.pathsep}assets",
+    "--add-data",
+    f"services{os.pathsep}services",
+    "--add-data",
+    f"configs/system/config.example.yaml{os.pathsep}configs/system/.",
+    "--add-data",
+    f"wingmen{os.pathsep}wingmen",
+    "--add-data",
+    f"skills{os.pathsep}skills",  # Bundle skills directly (not via templates)
+    "--add-data",
+    f"templates/configs{os.pathsep}templates/configs",  # Config templates only
+    "--add-data",
+    f"audio_samples{os.pathsep}audio_samples",
+    "--add-data",
+    f"LICENSE{os.pathsep}.",
+]
+subprocess.call(cmd)

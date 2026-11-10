@@ -1,0 +1,564 @@
+from enum import Enum, IntEnum
+from pydantic import BaseModel
+
+
+# Enum declarations
+class LogType(Enum):
+    # System/Runtime messages (by importance/category)
+    SYSTEM = "system"  # Gray - least important, lifecycle events like "Playback started", "Client disconnected"
+    INFO = "info"  # Blue - general runtime info, "good to know" messages
+    STARTUP = "startup"  # Teal/Cyan - important status on startup, version info, paths
+    WARNING = "warning"  # Yellow - attention required but not an error
+    ERROR = "error"  # Red - errors
+
+    # Feature-specific categories (for differentiated logging)
+    MCP = "mcp"  # Dedicated color for MCP-related messages
+    SKILL = "skill"  # Dedicated color for Skills-related messages (system-level)
+    COMMAND = "command"  # Dedicated color for Command execution messages
+    WINGMAN = "wingman"  # Dedicated color for Wingman-specific status messages
+    LOCALMODEL = "localmodel"  # Messages from the local support/embedding model — not part of conversation history
+    MEMORY = "memory"  # Persistent memory operations (recall, store, forget)
+    FILLER = "filler"  # Short line spoken while a slow tool runs — not part of conversation history
+
+    # Conversation messages
+    USER = "user"  # Pink/Purple - user speech/input
+    POSITIVE = "positive"  # Green - LLM responses, success messages
+
+    # Legacy aliases (deprecated, use semantic names above)
+    SUBTLE = "system"  # -> SYSTEM
+    HIGHLIGHT = "startup"  # -> STARTUP
+    PURPLE = "user"  # -> USER
+
+
+class LogSource(Enum):
+    SYSTEM = "system"
+    USER = "user"
+    WINGMAN = "wingman"
+
+
+class ToastType(Enum):
+    NORMAL = "normal"
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+
+class WingmanInitializationErrorType(Enum):
+    UNKNOWN = "unknown"
+    INVALID_CONFIG = "invalid_config"
+    MISSING_SECRET = "missing_secret"
+    MCP_CONNECTION_FAILED = "mcp_connection_failed"
+    SKILL_INITIALIZATION_FAILED = "skill_initialization_failed"
+
+
+class CoreState(Enum):
+    """Represents the lifecycle state of Wingman AI Core.
+
+    Used to communicate the current state to the client via /ping endpoint
+    and WebSocket core_state_changed command.
+    """
+
+    STARTING = "starting"  # Core just launched, not ready yet
+    MIGRATING = "migrating"  # Running config migrations
+    LOADING_CONFIG = "loading_config"  # Loading configuration files
+    INITIALIZING_WINGMEN = "initializing_wingmen"  # Tower/Wingmen initialization
+    READY = "ready"  # Fully operational, ready to accept commands
+    SHUTTING_DOWN = "shutting_down"  # Graceful shutdown in progress
+
+
+class CommandTag(Enum):
+    RECORDING_STARTED = "recording_started"
+    RECORDING_STOPPED = "recording_stopped"
+    IGNORED_RECORDING = "ignored_recording"
+    PLAYBACK_STARTED = "playback_started"
+    PLAYBACK_STOPPED = "playback_stopped"
+    UNAUTHORIZED = "unauthorized"
+    CONFIG_LOADED = "config_loaded"
+    SECRET_SAVED = "secret_saved"
+    BINDING_UNBOUND = "binding_unbound"
+
+
+class CustomPropertyType(Enum):
+    STRING = "string"
+    TEXTAREA = "textarea"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+    SINGLE_SELECT = "single_select"
+    VOICE_SELECTION = "voice_selection"
+    SLIDER = "slider"
+    AUDIO_FILES = "audio_files"
+    AUDIO_DEVICE = "audio_device"
+    COLOR = "color"
+    RANGE_SLIDER = "range_slider"
+    DIRECTORY = "directory"
+    """A folder on the user's computer. The client offers a folder picker."""
+    FILE = "file"
+    """A file on the user's computer. The client offers a file picker."""
+
+
+class TtsVoiceGender(Enum):
+    UNKNOWN = "Unknown"
+    MALE = "Male"
+    FEMALE = "Female"
+    NEUTRAL = "Neutral"
+
+
+class VoiceCloneState(Enum):
+    """Whether a Pocket TTS voice fits the loaded model."""
+
+    CURRENT = "current"
+    """Made for this model, or Wingman makes it from the voice's recording."""
+    OUTDATED = "outdated"
+    """Only an older clone and no recording to make it again: it speaks with
+    the old clone."""
+    MISSING = "missing"
+    """Only clones for other models and no recording: it cannot speak."""
+
+
+class PerplexityModel(Enum):
+    """https://docs.perplexity.ai/models/model-cards"""
+
+    SONAR_DEEP_SEARCH = "sonar-deep-research"
+    SONAR_REASON_PRO = "sonar-reasoning-pro"
+    SONAR_REASON = "sonar-reasoning"
+    SONAR_PRO = "sonar-pro"
+    SONAR = "sonar"
+    R1_1776 = "r1-1776"
+
+
+class SoundEffect(Enum):
+    AI = "AI"
+    LOW_QUALITY_RADIO = "LOW_QUALITY_RADIO"
+    MEDIUM_QUALITY_RADIO = "MEDIUM_QUALITY_RADIO"
+    HIGH_END_RADIO = "HIGH_END_RADIO"
+    INTERIOR_SMALL = "INTERIOR_SMALL"
+    INTERIOR_MEDIUM = "INTERIOR_MEDIUM"
+    INTERIOR_LARGE = "INTERIOR_LARGE"
+
+
+class TtsProvider(Enum):
+    OPENAI = "openai"
+    ELEVENLABS = "elevenlabs"
+    EDGE_TTS = "edge_tts"
+    XVASYNTH = "xvasynth"
+    WINGMAN_PRO = "wingman_pro"
+    OPENAI_COMPATIBLE = "openai_compatible"
+    HUME = "hume"
+    INWORLD = "inworld"
+    POCKET_TTS = "pocket_tts"
+
+
+class SttProvider(Enum):
+    """Parakeet on this machine or on a server of the user's; the
+    subscription's cloud transcription otherwise."""
+
+    PARAKEET = "parakeet"
+    WINGMAN_PRO = "wingman_pro"
+
+
+class SpokenLanguage(Enum):
+    """The one language the user and their Wingmen speak.
+
+    Only languages every voice provider handles: Parakeet v3 transcribes them,
+    Pocket TTS has a model for each, Inworld speaks them at its highest tier.
+    Everything language-specific - the answer language, the Pocket TTS model,
+    the transcription and speech language hints - is derived from it (see
+    services/spoken_language.py), so no combination can be set that does not
+    work together.
+
+    OTHER is any other language, named in settings.other_language. Wingman
+    then passes no language to speech recognition, names it to the
+    conversation model and speaks through a provider that has voices for it
+    (services/other_language.py).
+    """
+
+    EN = "en"
+    DE = "de"
+    FR = "fr"
+    ES = "es"
+    IT = "it"
+    PT = "pt"
+    NL = "nl"
+    OTHER = "other"
+
+
+class PocketTtsQuality(Enum):
+    """Which size of the Pocket TTS model for the spoken language is loaded.
+
+    STANDARD is the 6-layer model, about 6x faster than real time on a laptop
+    CPU. HIGH is the 24-layer model: better voices, about 2x real time. A
+    language with only one size uses it for both.
+    """
+
+    STANDARD = "standard"
+    HIGH = "high"
+
+
+class ScGameLogRulesProblem(Enum):
+    """Why the Star Citizen log rules may be out of date.
+
+    The rules live on GitHub, maintained by a community member, because the
+    game changes its log wording more often than Wingman ships. The reader
+    keeps working with the rules it has in every case.
+    """
+
+    UNREACHABLE = "unreachable"
+    """GitHub did not answer, or answered with an error."""
+    INVALID = "invalid"
+    """The published rules do not validate. The maintainer has to fix them."""
+    NEEDS_UPDATE = "needs_update"
+    """The published rules need a newer Wingman."""
+
+
+class ScTelemetryState(Enum):
+    """What Star Citizen's telemetry stream is doing (services/sc_telemetry)."""
+
+    OFF = "off"
+    """Switched off in the settings, or the user does not play Star Citizen."""
+    UNAVAILABLE = "unavailable"
+    """This build of Wingman cannot read it: gRPC or protobuf is missing."""
+    WAITING = "waiting"
+    """Nothing answers: the game is not running, or runs without telemetry."""
+    GAME_WITHOUT_TELEMETRY = "game_without_telemetry"
+    """The game runs, but its Game.log shows no telemetry. On Windows the RSI
+    Launcher was started before the switch: quit it completely and start it again."""
+    CONNECTED = "connected"
+    """The game answers but sends no frames: menus or loading."""
+    LIVE = "live"
+    INCOMPATIBLE = "incompatible"
+    """The game answers, but not in the shape Wingman knows: a game patch changed it."""
+
+
+class SkillRequirement(Enum):
+    """A Core service a skill needs switched on in the settings.
+
+    Declared in a skill's manifest under `requires`. The client greys the
+    skill out and tells the user which setting to turn on first.
+    """
+
+    HUD_SERVER = "hud_server"
+    """The HUD (settings.hud_server). Runs on Windows, macOS and Linux with X11."""
+    SC_GAMELOG = "sc_gamelog"
+    """The Star Citizen log reader (settings.sc_gamelog)."""
+    SC_TELEMETRY = "sc_telemetry"
+    """Star Citizen's telemetry stream (settings.sc_telemetry)."""
+
+
+class StarCitizenFeatureKind(Enum):
+    """What a Star Citizen feature on a shipped Wingman is."""
+
+    SKILL = "skill"
+    MCP = "mcp"
+
+
+class HudAlign(Enum):
+    """Where a HUD container sits inside its area when its content is shorter."""
+
+    TOP = "top"
+    """Sticks to the top edge of the area and grows down."""
+    CENTER = "center"
+    """Stays in the middle of the area and grows up and down."""
+    BOTTOM = "bottom"
+    """Sticks to the bottom edge of the area and grows up."""
+
+
+class LocalAiMode(Enum):
+    """Where the support model runs.
+
+    CLOUD is the default: the model behind memory, summarisation and tool-response
+    compression runs on our backend, which costs the user no RAM and no CPU while
+    a game is running. LOCAL is llama.cpp managed by Core on this machine. SERVER
+    is a llama-server the user runs somewhere else.
+
+    Embeddings follow: SERVER puts them on the remote llama-server, the other two
+    keep them on this machine. The vector database is local either way, and an
+    embedding computed by a different model would not be comparable to the ones
+    already stored.
+    """
+
+    CLOUD = "cloud"
+    LOCAL = "local"
+    SERVER = "server"
+
+
+class DecisionModelProvider(Enum):
+    """Who answers the decision model's questions.
+
+    All three take TypeSafe's System One request unchanged, so switching is a
+    different URL, key and model name, nothing else.
+    """
+
+    WINGMAN_PRO = "wingman_pro"
+    """The default: the plan pays and the backend picks the model."""
+    OPENROUTER = "openrouter"
+    """The user's own OpenRouter key and any decision model OpenRouter lists."""
+    SERVER = "server"
+    """A System One server the user runs: oMLX, local-jev, opendecider."""
+
+
+class ConversationProvider(Enum):
+    OPENAI = "openai"
+    MISTRAL = "mistral"
+    GROQ = "groq"
+    OPENROUTER = "openrouter"
+    LOCAL_LLM = "local_llm"
+    WINGMAN_PRO = "wingman_pro"
+    GOOGLE = "google"
+    CEREBRAS = "cerebras"
+    PERPLEXITY = "perplexity"
+    XAI = "xai"
+
+
+class ImageGenerationProvider(Enum):
+    OPENAI = "openai"
+    WINGMAN_PRO = "wingman_pro"
+
+
+class ImageStyle(Enum):
+    """Art style presets for generated images. services/image_generation.py
+    holds the text each one adds to the prompt. NONE adds nothing."""
+
+    NONE = "none"
+    CINEMATIC = "cinematic"
+    PHOTO = "photo"
+    ANIME = "anime"
+    GHIBLI = "ghibli"
+    PIXAR = "pixar"
+    CARTOON = "cartoon"
+    COMIC = "comic"
+    OIL_PAINTING = "oil_painting"
+    PIXEL_ART = "pixel_art"
+    SYNTHWAVE = "synthwave"
+    RETRO_SCIFI = "retro_scifi"
+    CLAYMATION = "claymation"
+    SKETCH = "sketch"
+
+
+class ImageAspect(Enum):
+    SQUARE = "square"
+    PORTRAIT = "portrait"
+    LANDSCAPE = "landscape"
+
+
+class KeyboardRecordingType(Enum):
+    SINGLE = "single"
+    MACRO = "macro"
+    MACRO_ADVANCED = "macro_advanced"
+
+
+class RecordingDevice(Enum):
+    KEYBOARD = "keyboard"
+    MOUSE = "mouse"
+    JOYSTICK = "joystick"
+
+
+class WingmanProTtsProvider(Enum):
+    # Two providers since 3.2.6. Azure is back as the voice every plan has
+    # (15 dollars per million characters), Inworld (5) is in Pro and Ultra.
+    # Which of them a plan may use comes from the backend's /api/v1/models.
+    # Inworld stays first: the sanitizer falls back to the first member when a
+    # stored value is unknown and no template value is at hand.
+    INWORLD = "inworld"
+    AZURE = "azure"
+
+
+class SpeechPriority(IntEnum):
+    """Who may talk over whom on the shared speakers. Lower is more
+    important. See services/speech_priority.py."""
+
+    ANSWER = 0
+    """What the user asked for: answers, the filler line, command responses."""
+    EVENT = 1
+    """Said on the wingman's own initiative about something that happened:
+    a game event, a timer. Waits for the user and for answers."""
+    BACKGROUND = 2
+    """Atmosphere such as radio chatter. Never talks over anything."""
+
+
+class McpTransportType(Enum):
+    """Transport type for MCP server connections."""
+
+    HTTP = "http"
+    STDIO = "stdio"
+    SSE = "sse"
+
+
+class McpAuthType(Enum):
+    """How Wingman authenticates against an MCP server.
+
+    NONE is the default and sends nothing. API_KEY is what Wingman did before
+    3.2.1: the secret `mcp_<name>` goes out as a bearer header. OAUTH runs an
+    authorization code grant with PKCE and sends the resulting access token,
+    refreshing it when it expires.
+    """
+
+    NONE = "none"
+    API_KEY = "api_key"
+    OAUTH = "oauth"
+
+
+# Pydantic models for enums
+class BaseEnumModel(BaseModel):
+    class Config:
+        # fix pydantic serialization of enums
+        json_encoders = {
+            Enum: lambda v: v.value,
+        }
+
+
+class LogTypeEnumModel(BaseEnumModel):
+    log_type: LogType
+
+
+class LogSourceEnumModel(BaseEnumModel):
+    log_source: LogSource
+
+
+class ToastTypeEnumModel(BaseEnumModel):
+    toast_type: ToastType
+
+
+class WingmanInitializationErrorTypeModel(BaseEnumModel):
+    error_type: WingmanInitializationErrorType
+
+
+class CommandTagEnumModel(BaseEnumModel):
+    command_tag: CommandTag
+
+
+class CustomPropertyTypeEnumModel(BaseEnumModel):
+    property_type: CustomPropertyType
+
+
+class TtsVoiceGenderEnumModel(BaseEnumModel):
+    gender: TtsVoiceGender
+
+
+class VoiceCloneStateEnumModel(BaseEnumModel):
+    state: VoiceCloneState
+
+
+class PerplexityModelEnumModel(BaseEnumModel):
+    model: PerplexityModel
+
+
+class SoundEffectEnumModel(BaseEnumModel):
+    sound_effect: SoundEffect
+
+
+class TtsProviderEnumModel(BaseEnumModel):
+    tts_provider: TtsProvider
+
+
+class SttProviderEnumModel(BaseEnumModel):
+    stt_provider: SttProvider
+
+
+class ConversationProviderEnumModel(BaseEnumModel):
+    conversation_provider: ConversationProvider
+
+
+class ImageGenerationProviderEnumModel(BaseEnumModel):
+    image_generation_provider: ImageGenerationProvider
+
+
+class ImageStyleEnumModel(BaseEnumModel):
+    image_style: ImageStyle
+
+
+class ImageAspectEnumModel(BaseEnumModel):
+    image_aspect: ImageAspect
+
+
+class KeyboardRecordingTypeModel(BaseEnumModel):
+    recording_type: KeyboardRecordingType
+
+
+class RecordingDeviceModel(BaseEnumModel):
+    recording_device: RecordingDevice
+
+
+class WingmanProTtsProviderModel(BaseEnumModel):
+    tts_provider: WingmanProTtsProvider
+
+
+class CoreStateEnumModel(BaseEnumModel):
+    core_state: CoreState
+
+
+class ScGameLogRulesProblemEnumModel(BaseEnumModel):
+    sc_gamelog_rules_problem: ScGameLogRulesProblem
+
+
+class ScTelemetryStateEnumModel(BaseEnumModel):
+    sc_telemetry_state: ScTelemetryState
+
+
+class SkillRequirementEnumModel(BaseEnumModel):
+    skill_requirement: SkillRequirement
+
+
+class StarCitizenFeatureKindEnumModel(BaseEnumModel):
+    star_citizen_feature_kind: StarCitizenFeatureKind
+
+
+class HudAlignEnumModel(BaseEnumModel):
+    hud_align: HudAlign
+
+
+class LocalAiModeEnumModel(BaseEnumModel):
+    local_ai_mode: LocalAiMode
+
+
+class DecisionModelProviderEnumModel(BaseEnumModel):
+    decision_model_provider: DecisionModelProvider
+
+
+class SpokenLanguageEnumModel(BaseEnumModel):
+    spoken_language: SpokenLanguage
+
+
+class PocketTtsQualityEnumModel(BaseEnumModel):
+    pocket_tts_quality: PocketTtsQuality
+
+
+# Add all additional Pydantic models for enums as needed
+
+
+# Enums and their corresponding model classes for dynamic schema generation
+ENUM_TYPES = {
+    "LogType": LogTypeEnumModel,
+    "LogSource": LogSourceEnumModel,
+    "ToastType": ToastTypeEnumModel,
+    "WingmanInitializationErrorType": WingmanInitializationErrorTypeModel,
+    "CommandTag": CommandTagEnumModel,
+    "CustomPropertyType": CustomPropertyTypeEnumModel,
+    "TtsVoiceGender": TtsVoiceGenderEnumModel,
+    "VoiceCloneState": VoiceCloneStateEnumModel,
+    "SoundEffect": SoundEffectEnumModel,
+    "TtsProvider": TtsProviderEnumModel,
+    "SttProvider": SttProviderEnumModel,
+    "ConversationProvider": ConversationProviderEnumModel,
+    "KeyboardRecordingType": KeyboardRecordingTypeModel,
+    "WingmanProTtsProvider": WingmanProTtsProviderModel,
+    "PerplexityModel": PerplexityModelEnumModel,
+    "RecordingDevice": RecordingDeviceModel,
+    "CoreState": CoreStateEnumModel,
+    "LocalAiMode": LocalAiModeEnumModel,
+    "DecisionModelProvider": DecisionModelProviderEnumModel,
+    "ScGameLogRulesProblem": ScGameLogRulesProblemEnumModel,
+    "ScTelemetryState": ScTelemetryStateEnumModel,
+    "SkillRequirement": SkillRequirementEnumModel,
+    "StarCitizenFeatureKind": StarCitizenFeatureKindEnumModel,
+    "HudAlign": HudAlignEnumModel,
+    "SpokenLanguage": SpokenLanguageEnumModel,
+    "PocketTtsQuality": PocketTtsQualityEnumModel,
+    "ImageStyle": ImageStyleEnumModel,
+    "ImageAspect": ImageAspectEnumModel,
+    # Add new enums here as key-value pairs
+}
+
+
+# make yaml.dump save Pydantic enums as strings
+def enum_representer(dumper, value):
+    return dumper.represent_data(value.value)

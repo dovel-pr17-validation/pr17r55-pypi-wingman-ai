@@ -1,0 +1,20 @@
+module: skills.timer.main
+name: Timer
+api_version: 3
+display_name: Timer
+author: JayMatthew
+discoverable_by_default: true
+tags:
+  - Utility
+description:
+  en: Gives your Wingman the ability to delay actions - be it a reminder, a command or a function call.
+  de: Gibt deinem Wingman die Möglichkeit, Aktionen zu verzögern - sei es eine Erinnerung, ein Befehl oder ein Funktionsaufruf.
+discovery_keywords:
+  - reminder
+  - timer
+  - delay
+  - schedule
+  - set timer
+  - remind me
+  - countdown
+  - wait

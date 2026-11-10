@@ -1,0 +1,150 @@
+module: skills.radio_chatter.main
+name: RadioChatter
+api_version: 3
+display_name: Radio Chatter
+author: JayMatthew
+tags:
+  - Game
+  - Music
+auto_activate: true
+description:
+  en: Randomly playback radio chatter over time. Customize the participants and their voices.
+  de: Spielt zufällige Funkgespräche ab. Passe die Teilnehmer und ihre Stimmen an.
+discoverable_by_default: false
+property_groups:
+  - id: content
+    name: Conversation
+    hint: Who talks and what about.
+  - id: timing
+    name: Timing
+  - id: sound
+    name: Sound
+custom_properties:
+  - id: prompt
+    group: content
+    name: Scenario
+    hint: The scenario for the generated radio chatter. If empty, a generic radio conversation is used.
+    required: false
+    value: "Generate a dialog between random pilots in the Star Citizen universe. Feel free to throw in some random details. Keep in mind that Port Olisar does no longer exist."
+    property_type: textarea
+  - id: voices
+    group: content
+    name: Voices
+    hint: The voices the participants speak with.
+    value: []
+    required: false
+    property_type: voice_selection
+    options:
+      - label: "multiple"
+        value: true
+  - id: interval_range
+    group: timing
+    name: Interval (sec)
+    hint: Time between two conversations, also before the first one.
+    value: [60, 900]
+    required: true
+    property_type: range_slider
+    options:
+      - label: "min"
+        value: 60
+      - label: "max"
+        value: 1800
+      - label: "step"
+        value: 10
+  - id: messages_range
+    group: timing
+    name: Messages per conversation
+    hint: How many messages one conversation has.
+    value: [1, 5]
+    required: true
+    property_type: range_slider
+    options:
+      - label: "min"
+        value: 1
+      - label: "max"
+        value: 5
+      - label: "step"
+        value: 1
+  - id: participants_range
+    group: content
+    name: Participants
+    hint: How many speakers take part in one conversation.
+    value: [2, 3]
+    required: true
+    property_type: range_slider
+    options:
+      - label: "min"
+        value: 1
+      - label: "max"
+        value: 5
+      - label: "step"
+        value: 1
+  - id: force_radio_sound
+    group: sound
+    name: Force radio effect
+    hint: Plays the chatter with one of the radio effects below instead of the Wingman's sound effects.
+    value: True
+    required: false
+    property_type: boolean
+  - id: radio_sounds
+    group: sound
+    name: Radio effects
+    hint: Used at random when "Force radio effect" is on.
+    value: "low, medium"
+    required: false
+    property_type: single_select
+    options:
+      - label: "Low"
+        value: "low"
+      - label: "Medium"
+        value: "medium"
+      - label: "High"
+        value: "high"
+      - label: "Low & Medium"
+        value: "low, medium"
+      - label: "Low & High"
+        value: "low, high"
+      - label: "Medium & High"
+        value: "medium, high"
+      - label: "All"
+        value: "low, medium, high"
+  - id: auto_start
+    name: Auto start
+    hint: Starts the radio chatter together with your Wingman.
+    value: True
+    required: false
+    property_type: boolean
+  - id: volume
+    group: sound
+    name: Volume
+    hint: Relative to the Wingman's volume, from 0.0 (silent) to 1.0 (as loud as the Wingman).
+    value: 0.5
+    required: false
+    property_type: slider
+    options:
+      - label: "min"
+        value: 0.0
+      - label: "max"
+        value: 1.0
+      - label: "step"
+        value: 0.1
+  - id: print_chatter
+    name: Show chatter in messages
+    hint: Shows the generated chatter in the message overview.
+    value: True
+    required: false
+    property_type: boolean
+#  disable knowledge integration for now
+#  - id: radio_knowledge
+#    name: Radio knowledge
+#    hint: If enabled, the radio chatter messages will be added to the Wingman conversation. This way you can talk with your Wingman about the radio chatter.
+#    value: False
+#    required: false
+#    property_type: boolean
+  - id: use_beeps
+    group: sound
+    name: Beeps
+    hint: A beep at the start and end of each message.
+    value: True
+    required: false
+    property_type: boolean

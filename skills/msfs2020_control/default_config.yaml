@@ -1,0 +1,55 @@
+module: skills.msfs2020_control.main
+name: Msfs2020Control
+api_version: 3
+display_name: Microsoft Flight Simulator Control
+author: teddybear082
+platforms:
+  - windows
+tags:
+  - Game
+  - MSFS
+description:
+  en: Control and retrieve data from MSFS2020/2024 dynamically using SimConnect.
+  de: Steuern und Abrufen von Daten aus MSFS2020/2024 dynamisch mit SimConnect.
+discovery_keywords:
+  - flight simulator
+  - altitude
+  - speed
+  - autopilot
+  - navigation
+  - instruments
+  - aircraft
+  - heading
+  - plane
+  - throttle
+  - flaps
+discoverable_by_default: false
+hint:
+  en: This skill can retrieve data and perform actions in the MSFS2020/2024 simulator based on dynamic inputs.
+  de: Dieser Skill kann Daten abrufen und Aktionen im MSFS2020/2024-Simulator basierend auf dynamischen Eingaben ausführen.
+custom_properties:
+  - hint: Whether to try to autostart data monitoring mode (tour guide mode), which automatically monitors for latitude, longitude and altitude. This can also be toggled with a voice command to start or end data monitoring mode.
+    id: autostart_data_monitoring_loop_mode
+    name: Autostart tour guide mode
+    property_type: boolean
+    required: true
+    value: false
+  - hint: Minimum interval in seconds before data monitoring loop will run again, in seconds.
+    id: min_data_monitoring_seconds
+    name: Minimum monitoring interval
+    property_type: number
+    required: true
+    value: 60
+  - hint: Maximum interval in seconds before data monitoring loop will run again, in seconds.
+    id: max_data_monitoring_seconds
+    name: Maximum monitoring interval
+    property_type: number
+    required: true
+    value: 360
+  - hint: The backstory to use for data monitoring mode. Leave blank if you just want to use what is already in your wingman's backstory.
+    id: data_monitoring_backstory
+    name: Tour guide mode backstory
+    property_type: textarea
+    required: false
+    value: |
+      You are a friendly copilot in the plane with the user, the pilot.  Casually comment on the following information in a way that keeps your personality and role play.  If it is data about a place, comment about just having flown over the place (or if the plane is on the ground, about being at the place) and provide some brief commentary on the place in an engaging tone.  Keep your remarks succinct, and avoid directly talking about latitudes and longitudes:

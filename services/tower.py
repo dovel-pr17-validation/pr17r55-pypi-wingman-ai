@@ -1,0 +1,411 @@
+import asyncio
+from api.enums import LogSource, LogType, WingmanInitializationErrorType
+from api.interface import (
+    Config,
+    SettingsConfig,
+    WingmanConfig,
+    WingmanInitializationError,
+    ConfigDirInfo,
+)
+from providers.pocket_tts import PocketTTS
+from providers.xvasynth import XVASynth
+from services.audio_player import AudioPlayer
+from services.audio_library import AudioLibrary
+from services.config_manager import ConfigManager
+from services.name_match import find_name, words_of
+from services.printr import Printr
+from wingmen.open_ai_wingman import OpenAiWingman
+from wingmen.wingman import Wingman
+
+
+printr = Printr()
+
+
+class Tower:
+    def __init__(
+        self,
+        config: Config,
+        config_dir: ConfigDirInfo,
+        config_manager: ConfigManager,
+        audio_player: AudioPlayer,
+        audio_library: AudioLibrary,
+        xvasynth: XVASynth,
+        pocket_tts: PocketTTS,
+        settings_service=None,
+        local_ai_service=None,
+    ):
+        self.audio_player = audio_player
+        self.audio_library = audio_library
+        self.settings_service = settings_service
+        self.config = config
+        self.config_dir = config_dir
+        self.config_manager = config_manager
+        self.wingmen: list[Wingman] = []
+        self.disabled_wingmen: list[WingmanConfig] = []
+        self.log_source_name = "Tower"
+        self.xvasynth = xvasynth
+        self.pocket_tts = pocket_tts
+        self.local_ai_service = local_ai_service
+
+    async def instantiate_wingmen(self, settings: SettingsConfig):
+        errors: list[WingmanInitializationError] = []
+
+        if not self.config.wingmen:
+            return errors
+
+        # Prepare wingman instantiation tasks for parallel execution
+        tasks = []
+        disabled_wingmen = []
+
+        for wingman_name, wingman_config in self.config.wingmen.items():
+            if wingman_config.disabled is True:
+                disabled_wingmen.append(wingman_config)
+                printr.print(
+                    f"Skipped instantiating disabled wingman {wingman_config.name}.",
+                    color=LogType.WARNING,
+                    server_only=True,
+                    source_name=self.log_source_name,
+                    source=LogSource.SYSTEM,
+                )
+                continue
+
+            # Create task for this wingman
+            task = self.__instantiate_wingman(
+                wingman_name=wingman_name,
+                wingman_config=wingman_config,
+                settings=settings,
+                errors=errors,
+            )
+            tasks.append(task)
+
+        # Instantiate all wingmen in parallel
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        # Add disabled wingmen to the list
+        self.disabled_wingmen.extend(disabled_wingmen)
+
+        printr.print(
+            f"Instantiated wingmen: {', '.join([w.name for w in self.wingmen])}.",
+            color=LogType.POSITIVE,
+            server_only=True,
+            source_name=self.log_source_name,
+            source=LogSource.SYSTEM,
+        )
+        return errors
+
+    async def __instantiate_wingman(
+        self,
+        wingman_name: str,
+        wingman_config: WingmanConfig,
+        settings: SettingsConfig,
+        errors: list[WingmanInitializationError],
+    ):
+        wingman = None
+        try:
+            wingman = OpenAiWingman(
+                name=wingman_name,
+                config=wingman_config,
+                settings=settings,
+                audio_player=self.audio_player,
+                audio_library=self.audio_library,
+                xvasynth=self.xvasynth,
+                pocket_tts=self.pocket_tts,
+                tower=self,
+                settings_service=self.settings_service,
+            )
+        except FileNotFoundError as e:  # pylint: disable=broad-except
+            self._keep_disabled(wingman_config)
+            printr.print(
+                f"Could not instantiate {wingman_name}:\n{str(e)}",
+                color=LogType.WARNING,
+                server_only=True,
+                source_name=self.log_source_name,
+                source=LogSource.SYSTEM,
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            self._keep_disabled(wingman_config)
+            # just in case we missed something
+            msg = str(e).strip() or type(e).__name__
+            errors.append(
+                WingmanInitializationError(
+                    wingman_name=wingman_name,
+                    message=msg,
+                    error_type=WingmanInitializationErrorType.UNKNOWN,
+                )
+            )
+        else:
+            # Before anything runs: memory and skills ask for the support model.
+            wingman.local_ai_service = self.local_ai_service
+
+            # additional validation check if no exception was raised
+            validation_errors = await wingman.validate()
+            errors.extend(validation_errors)
+
+            # init and validate skills
+            # Note: skill errors are non-fatal but should be shown to user
+            skill_errors = await wingman.init_skills()
+            errors.extend(skill_errors)  # Add to errors for client notification
+
+            # init MCP servers (if the wingman supports them)
+            # Note: MCP errors are non-fatal but should be shown to user
+            if hasattr(wingman, "init_mcps"):
+                try:
+                    mcp_errors = await wingman.init_mcps()
+                    errors.extend(mcp_errors)  # Add to errors for client notification
+                except Exception as e:
+                    printr.print(
+                        f"Error initializing MCP servers for {wingman_name}: {e}",
+                        color=LogType.ERROR,
+                        server_only=True,
+                    )
+
+            # Check for fatal errors that should prevent wingman loading
+            # MCP, skill, and missing secret errors are non-fatal
+            fatal_errors = [
+                e
+                for e in errors
+                if e.error_type
+                not in [
+                    WingmanInitializationErrorType.MCP_CONNECTION_FAILED,
+                    WingmanInitializationErrorType.MISSING_SECRET,
+                    WingmanInitializationErrorType.SKILL_INITIALIZATION_FAILED,
+                ]
+            ]
+
+            if not fatal_errors:
+                self.wingmen.append(wingman)
+
+        return wingman
+
+    def get_wingman_from_text(self, text: str) -> Wingman | None:
+        """The wingman addressed in the text, else the default one."""
+        return self.get_addressed_wingman(text) or self.get_default_wingman()
+
+    def get_addressed_wingman(self, text: str) -> Wingman | None:
+        """The wingman named in the text.
+
+        A name is matched by sound, not by spelling: the speech model writes
+        "Eva" for Ava and "Computa" for Computer, and an exact word match then
+        sends the sentence to the wrong wingman or nowhere. Only the opening of
+        the sentence is searched, that is where people put a name.
+        """
+        words = words_of(text)
+        best: tuple[int, Wingman | None] = (10**6, None)
+        for wingman in self.wingmen:
+            found = find_name(words, wingman.config.name)
+            if found is not None and found[2] < best[0]:
+                best = (found[2], wingman)
+        return best[1]
+
+    def get_default_wingman(self) -> Wingman | None:
+        """The wingman with the star: it answers what names nobody."""
+        for wingman in self.wingmen:
+            if wingman.config.is_voice_activation_default:
+                return wingman
+        return None
+
+    def get_wingman_by_name(self, wingman_name: str):
+        for wingman in self.wingmen:
+            if wingman.config.name == wingman_name:
+                return wingman
+        return None
+
+    def get_disabled_wingman_by_name(self, wingman_name: str):
+        for wingman_config in self.disabled_wingmen:
+            if wingman_config.name == wingman_name:
+                return wingman_config
+        return None
+
+    def _keep_disabled(self, wingman_config: WingmanConfig):
+        wingman_config.disabled = True
+        if wingman_config not in self.disabled_wingmen:
+            self.disabled_wingmen.append(wingman_config)
+
+    def keep_disabled_config(self, old_name: str, wingman_config: WingmanConfig):
+        """Keep the config just saved for a Wingman that is switched off, in
+        place of the entry under its old name. Enable builds the Wingman from
+        this entry, so it must have every edit made while it was off."""
+        for i, disabled_config in enumerate(self.disabled_wingmen):
+            if disabled_config.name == old_name:
+                self.disabled_wingmen[i] = wingman_config
+                return
+        self.disabled_wingmen.append(wingman_config)
+
+    async def enable_wingman(
+        self,
+        wingman_name: str,
+        settings: SettingsConfig,
+    ):
+        errors: list[WingmanInitializationError] = []
+        wingman_config = self.get_disabled_wingman_by_name(wingman_name)
+        if not wingman_config:
+            return False
+
+        wingman = await self.__instantiate_wingman(
+            wingman_name=wingman_name,
+            wingman_config=wingman_config,
+            settings=settings,
+            errors=errors,
+        )
+        # Shown like at startup, MCP errors are already logged by the client.
+        for error in errors:
+            if error.error_type != WingmanInitializationErrorType.MCP_CONNECTION_FAILED:
+                printr.toast_error(error.message)
+
+        if wingman not in self.wingmen:
+            # Fatal errors kept it out: it stays switched off, so the next
+            # Enable tries again instead of finding it in neither list.
+            self._keep_disabled(wingman_config)
+            if wingman:
+                try:
+                    await wingman.unload()
+                    await wingman.unload_mcps()
+                except Exception as e:  # pylint: disable=broad-except
+                    printr.print(
+                        f"Could not unload {wingman_name} after a failed enable: {e}",
+                        color=LogType.WARNING,
+                        server_only=True,
+                        source_name=self.log_source_name,
+                        source=LogSource.SYSTEM,
+                    )
+            return False
+
+        wingman_config.disabled = False
+        self.disabled_wingmen.remove(wingman_config)
+        await self._preload_voice(wingman)
+        printr.print(
+            f"Enabled wingman {wingman_name}.",
+            color=LogType.SYSTEM,
+            server_only=True,
+            source_name=self.log_source_name,
+            source=LogSource.SYSTEM,
+        )
+        return True
+
+    async def _preload_voice(self, wingman: Wingman):
+        """Warm the Pocket TTS voice of a Wingman switched on at runtime, like
+        Core does for all Wingmen at startup."""
+        pocket_tts = self.pocket_tts
+        if not pocket_tts or not pocket_tts.settings.enable or not pocket_tts.settings.run_locally:
+            return
+        if not pocket_tts.model:
+            return
+        voice = getattr(getattr(wingman.config, "pocket_tts", None), "voice", None)
+        if not voice:
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, pocket_tts.preload_voice_states, [voice]
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            # Only slower: the voice loads with the first answer instead.
+            printr.print(
+                f"Could not preload the voice of {wingman.name}: {e}",
+                color=LogType.WARNING,
+                server_only=True,
+                source_name=self.log_source_name,
+                source=LogSource.SYSTEM,
+            )
+
+    async def disable_wingman(self, wingman_name: str):
+        for wingman in self.wingmen:
+            if wingman.name == wingman_name:
+                wingman.config.disabled = True
+                self.disabled_wingmen.append(wingman.config)
+                # Out of the list first, so no new sentence is routed to it
+                # while its skills and MCP servers shut down.
+                self.wingmen.remove(wingman)
+                # An answer of this Wingman that is playing stops now.
+                if self.audio_player.is_playing and self.audio_player.wingman_name == wingman_name:
+                    await self.audio_player.stop_playback()
+                await wingman.unload()
+                await wingman.unload_mcps()
+                printr.print(
+                    f"Disabled wingman {wingman_name}.",
+                    color=LogType.SYSTEM,
+                    server_only=True,
+                    source_name=self.log_source_name,
+                    source=LogSource.SYSTEM,
+                )
+                return True
+        return False
+
+    def save_wingman(self, wingman_name: str):
+        for wingman in self.wingmen:
+            if wingman.name == wingman_name:
+                for wingman_file in self.config_manager.get_wingmen_configs(
+                    self.config_dir
+                ):
+                    if wingman_file.name == wingman_name:
+                        self.config_manager.save_wingman_config(
+                            config_dir=self.config_dir,
+                            wingman_file=wingman_file,
+                            wingman_config=wingman.config,
+                        )
+                        printr.print(
+                            f"Saved wingman {wingman_name}.",
+                            color=LogType.SYSTEM,
+                            server_only=True,
+                            source_name=self.log_source_name,
+                            source=LogSource.SYSTEM,
+                        )
+                        return True
+
+        printr.print(
+            f"Unable to save wingman {wingman_name}.",
+            color=LogType.WARNING,
+            server_only=True,
+            source_name=self.log_source_name,
+            source=LogSource.SYSTEM,
+        )
+        return False
+
+    def save_wingman_commands(self, wingman_name: str):
+        """Save only the commands section of a wingman config.
+
+        Uses partial YAML update to avoid full config serialization.
+        """
+        for wingman in self.wingmen:
+            if wingman.name == wingman_name:
+                for wingman_file in self.config_manager.get_wingmen_configs(
+                    self.config_dir
+                ):
+                    if wingman_file.name == wingman_name:
+                        self.config_manager.save_wingman_commands(
+                            config_dir=self.config_dir,
+                            wingman_file=wingman_file,
+                            commands=wingman.config.commands,
+                            command_categories=wingman.config.command_categories,
+                        )
+                        printr.print(
+                            f"Saved commands for {wingman_name}.",
+                            color=LogType.SYSTEM,
+                            server_only=True,
+                            source_name=self.log_source_name,
+                            source=LogSource.SYSTEM,
+                        )
+                        return True
+
+        printr.print(
+            f"Unable to save commands for {wingman_name}.",
+            color=LogType.WARNING,
+            server_only=True,
+            source_name=self.log_source_name,
+            source=LogSource.SYSTEM,
+        )
+        return False
+
+    def save_last_message(self, wingman_name: str, last_message: str):
+        for wingman in self.wingmen:
+            if wingman.name == wingman_name:
+                for wingman_file in self.config_manager.get_wingmen_configs(
+                    self.config_dir
+                ):
+                    if wingman_file.name == wingman_name:
+                        return self.config_manager.save_last_wingman_message(
+                            config_dir=self.config_dir,
+                            wingman_file=wingman_file,
+                            last_message=last_message,
+                        )
+        return False

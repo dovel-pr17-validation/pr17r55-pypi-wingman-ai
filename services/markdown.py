@@ -1,0 +1,509 @@
+import re
+from io import StringIO
+from markdown import Markdown
+
+from api.enums import SpokenLanguage
+
+# Maximum number of list items per list block before stripping that list for TTS
+MAX_LIST_ITEMS_FOR_TTS = 15
+
+# The word in front of the last item of a spoken list. A language without
+# one here gets a comma: an English "and" in a German answer is read out.
+_LIST_AND = {
+    SpokenLanguage.EN: "and",
+    SpokenLanguage.DE: "und",
+    SpokenLanguage.FR: "et",
+    SpokenLanguage.ES: "y",
+    SpokenLanguage.IT: "e",
+    SpokenLanguage.PT: "e",
+    SpokenLanguage.NL: "en",
+}
+
+
+def remove_emote_text(text: str):
+    """Removes emotes from text responses, which LLMs tend to place between *.
+
+    Args:
+        text (str): The response text passed, which may contain emotes.
+
+    Returns:
+        text: The response string with any strings between * removed.
+    """
+    while True:
+        start = text.find("*")
+        if start == -1:
+            break
+        end = text.find("*", start + 1)
+        if end == -1:
+            break
+        text = text[:start] + text[end + 1 :]
+    return text
+
+
+# A span between single asterisks: *sighs*, *leans back*. Not **bold**, not
+# a list bullet ("* item"), not a multiplication ("2 * 3").
+_STAR_SPAN_RE = re.compile(r"(?<![*\w])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![*\w])")
+
+
+def remove_action_emotes(text: str) -> str:
+    """Removes actions models write between single asterisks.
+
+    Runs before the Markdown conversion, which would otherwise turn *sighs*
+    into plain italic text that is then read aloud. A span counts as an
+    action where an action goes: at the start of a line, after a finished
+    sentence or at the end of a line. One in the middle of a sentence
+    ("that is *really* close") is emphasis and stays a word.
+    """
+
+    def replace(match: re.Match) -> str:
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        before = text[line_start : match.start()].rstrip()
+        after = text[match.end() : len(text) if line_end == -1 else line_end].strip()
+        if not before or before[-1] in ".!?…:" or not after:
+            return ""
+        return match.group(0)
+
+    return _STAR_SPAN_RE.sub(replace, text)
+
+
+def remove_emojis(text: str) -> str:
+    """Removes emoji characters from text.
+
+    Emojis don't work well with TTS - they either get skipped, read as
+    "emoji" or produce weird sounds depending on the provider.
+
+    Args:
+        text (str): The text that may contain emojis.
+
+    Returns:
+        str: The text with emojis removed.
+    """
+    # Comprehensive emoji pattern covering most Unicode emoji ranges
+    emoji_pattern = re.compile(
+        "["
+        "\U0001f600-\U0001f64f"  # emoticons
+        "\U0001f300-\U0001f5ff"  # symbols & pictographs
+        "\U0001f680-\U0001f6ff"  # transport & map symbols
+        "\U0001f1e0-\U0001f1ff"  # flags (iOS)
+        "\U00002702-\U000027b0"  # dingbats
+        # Enclosed characters. Not one range from U+24C2 to U+1F251: that
+        # swallowed every Chinese, Japanese and Korean character in between.
+        "\U000024c2"
+        "\U0001f170-\U0001f251"
+        "\U0001f900-\U0001f9ff"  # supplemental symbols & pictographs
+        "\U0001fa00-\U0001fa6f"  # chess symbols
+        "\U0001fa70-\U0001faff"  # symbols & pictographs extended-A
+        "\U00002600-\U000026ff"  # misc symbols
+        "\U00002700-\U000027bf"  # dingbats
+        "\U0001f000-\U0001f02f"  # mahjong tiles
+        "\U0001f0a0-\U0001f0ff"  # playing cards
+        "️‍"  # emoji presentation selector and joiner, left over otherwise
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub("", text)
+
+
+def extract_markdown_link_text(text: str) -> str:
+    """Extracts link text from Markdown links, removing the URL.
+
+    Converts [link text](url) to just "link text" so TTS reads the
+    descriptive text instead of the URL.
+
+    Args:
+        text (str): Text that may contain Markdown links.
+
+    Returns:
+        str: Text with Markdown links converted to just the link text.
+    """
+    # Pattern matches [link text](url) and captures just the link text
+    markdown_link_pattern = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+    return markdown_link_pattern.sub(r"\1", text)
+
+
+def remove_links(text: str):
+    """Removes standalone URLs from text.
+
+    Note: Call extract_markdown_link_text() first to preserve link text
+    from Markdown links before this strips remaining raw URLs.
+
+    Args:
+        text (str): Text that may contain URLs.
+
+    Returns:
+        tuple: (cleaned_text, contains_links)
+    """
+    # Regular expression pattern to match URLs
+    url_pattern = re.compile(
+        r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+    )
+
+    # Find all URLs in the text
+    urls = url_pattern.findall(text)
+    contains_links = bool(urls)
+
+    # Replace all URLs with an empty string
+    cleaned_text = url_pattern.sub("", text)
+
+    return cleaned_text, contains_links
+
+
+def remove_code_blocks(text: str):
+    """Removes code blocks enclosed in triple backticks."""
+    code_block_pattern = re.compile(r"```.*?```", re.DOTALL)
+
+    code_blocks = code_block_pattern.findall(text)
+    contains_code_blocks = bool(code_blocks)
+
+    cleaned_text = code_block_pattern.sub("", text)
+
+    return cleaned_text, contains_code_blocks
+
+
+def remove_tables(text: str) -> str:
+    """Removes markdown tables entirely — they never sound good in TTS.
+
+    Matches table blocks: lines starting with |, including the separator row
+    (e.g. |---|---|). Consecutive table lines are removed as a block.
+
+    Args:
+        text (str): Raw markdown text.
+
+    Returns:
+        str: Text with all tables removed.
+    """
+    # Match consecutive lines that start with | (table rows)
+    table_pattern = re.compile(
+        r"(^\|.+\|[ \t]*\n?){2,}",
+        re.MULTILINE,
+    )
+    return table_pattern.sub("", text)
+
+
+def _parse_list_block(lines: list[str]) -> list[dict]:
+    """Parses a block of markdown list lines into a structured representation.
+
+    Returns a list of top-level items, each with optional sub-items:
+        [{"text": "Combat Ships", "children": ["Avenger Stalker", "Redeemer"]}, ...]
+    """
+    items: list[dict] = []
+    current_item: dict = {"text": "", "children": []}
+    has_current = False
+
+    # Patterns for top-level and nested list items
+    top_level = re.compile(r"^(?:\d+[.)]\s+|[-*+]\s+)(.+)")
+    nested = re.compile(r"^(?:\s{2,}|\t)(?:\d+[.)]\s+|[-*+]\s+)(.+)")
+
+    for line in lines:
+        m_nested = nested.match(line)
+        m_top = top_level.match(line)
+
+        if m_nested and has_current:
+            # It's a sub-item of the current top-level item
+            current_item["children"].append(m_nested.group(1).strip())
+        elif m_top:
+            # New top-level item
+            current_item = {"text": m_top.group(1).strip(), "children": []}
+            has_current = True
+            items.append(current_item)
+
+    return items
+
+
+def _count_list_items(items: list[dict]) -> int:
+    """Counts total items including children."""
+    return sum(1 + len(item["children"]) for item in items)
+
+
+LIST_ITEM_SENTENCE_WORDS = 4
+"""A list with an item longer than this is spoken item by item as sentences;
+a shorter one as an enumeration ("Gear down and Lights on.")."""
+
+
+def _as_sentence(text: str) -> str:
+    text = text.strip().rstrip(",;:")
+    return text if text.endswith((".", "!", "?", "\u2026")) else text + "."
+
+
+def _format_list_for_tts(items: list[dict], and_word: str | None = "and") -> str:
+    """Formats parsed list items into natural speech.
+
+    Examples:
+        - Simple list: "Avenger Stalker, Redeemer, and Hammerhead."
+        - With sub-items: "Combat Ships: Avenger Stalker, Redeemer. Mining Ships: Prospector, Mole."
+    """
+    parts: list[str] = []
+
+    for item in items:
+        if item["children"]:
+            children_text = ", ".join(item["children"])
+            parts.append(f'{item["text"]}: {children_text}')
+        else:
+            parts.append(item["text"])
+
+    # Items that are sentences of their own ("Buy 288 SCU of Silicon at the
+    # Admin Office, Baijini Point, 565,632 aUEC") are said as sentences: joined
+    # with commas and an "and" they ran into one long sentence, and no voice
+    # could be heard to start a new item.
+    if all(not item["children"] for item in items) and any(
+        len(part.split()) > LIST_ITEM_SENTENCE_WORDS for part in parts
+    ):
+        return " ".join(_as_sentence(part) for part in parts)
+
+    # If all items are simple (no children), join with commas
+    if all(not item["children"] for item in items):
+        last = f"{and_word} {parts[-1]}" if and_word else parts[-1]
+        if len(parts) == 1:
+            return parts[0] + "."
+        elif len(parts) == 2:
+            return f"{parts[0]}{' ' if and_word else ', '}{last}."
+        else:
+            # The comma in front of "and" is English only.
+            joint = ", " if and_word in (None, "and") else " "
+            return ", ".join(parts[:-1]) + f"{joint}{last}."
+
+    # Items with sub-items get joined with periods
+    return ". ".join(parts) + "."
+
+
+def convert_lists_for_tts(text: str, and_word: str | None = "and") -> str:
+    """Converts markdown lists to TTS-friendly natural language.
+
+    Short lists are converted to spoken enumerations.
+    Long lists (> MAX_LIST_ITEMS_FOR_TTS total items in a single list block)
+    are stripped entirely.
+
+    Tolerates blank lines between list items (common in LLM output).
+
+    Args:
+        text (str): Raw markdown text.
+
+    Returns:
+        str: Text with lists converted to natural speech or removed.
+    """
+    lines = text.split("\n")
+    result_lines: list[str] = []
+    list_block: list[str] = []
+    blank_buffer: list[str] = []  # blank lines that might be inside a list
+    list_item_pattern = re.compile(r"^(\s*)(?:\d+[.)]\s+|[-*+]\s+)")
+
+    def flush_list_block():
+        """Process accumulated list lines and append result."""
+        if not list_block:
+            return
+        items = _parse_list_block(list_block)
+        if not items:
+            # Couldn't parse — re-add raw lines
+            result_lines.extend(list_block)
+            list_block.clear()
+            return
+        total = _count_list_items(items)
+        if total <= MAX_LIST_ITEMS_FOR_TTS:
+            result_lines.append(_format_list_for_tts(items, and_word))
+        # else: too long, strip entirely
+        list_block.clear()
+
+    for line in lines:
+        if list_item_pattern.match(line):
+            # This is a list item — absorb any buffered blank lines into the list
+            # (they were just spacing between items)
+            blank_buffer.clear()
+            list_block.append(line)
+        elif line.strip() == "" and list_block:
+            # Blank line while we're inside a list — buffer it
+            # (might be spacing between list items, or end of list)
+            blank_buffer.append(line)
+        else:
+            # Non-blank, non-list line — the list has ended
+            flush_list_block()
+            # The buffered blank lines were actually between the list and this text
+            result_lines.extend(blank_buffer)
+            blank_buffer.clear()
+            result_lines.append(line)
+
+    # Flush any trailing list block
+    flush_list_block()
+    # Don't forget trailing blank lines
+    result_lines.extend(blank_buffer)
+
+    return "\n".join(result_lines)
+
+
+def _write_with_tracking(
+    stream: StringIO, text: str, last_emitted_char: list[str | None]
+):
+    """Write text to stream and track the last emitted character."""
+    if not text:
+        return
+    stream.write(text)
+    last_emitted_char[0] = text[-1]
+
+
+def unmark_element(element, stream=None, last_emitted_char=None):
+    """Convert a Markdown HTML element tree to plain text with proper spacing.
+
+    Inserts spaces/newlines between block-level elements so that TTS
+    engines get proper word boundaries instead of words running together.
+    """
+    if stream is None:
+        stream = StringIO()
+    if last_emitted_char is None:
+        last_emitted_char = [None]
+
+    # Block-level tags that need separation
+    block_tags = {
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "tr",
+        "br",
+        "hr",
+        "blockquote",
+        "pre",
+    }
+
+    if element.text:
+        _write_with_tracking(stream, element.text, last_emitted_char)
+
+    for sub in element:
+        sub_tag = getattr(sub, "tag", None)
+        # Add spacing before block-level child elements
+        if sub_tag in block_tags:
+            last_char = last_emitted_char[0]
+            if last_char and last_char not in ("\n", " "):
+                # If we already end with sentence-ending punctuation, add a space.
+                # Otherwise add a sentence boundary to prevent word run-on.
+                if last_char in (".", "!", "?"):
+                    _write_with_tracking(stream, " ", last_emitted_char)
+                else:
+                    _write_with_tracking(stream, ". ", last_emitted_char)
+        unmark_element(sub, stream, last_emitted_char)
+
+    if element.tail:
+        _write_with_tracking(stream, element.tail, last_emitted_char)
+
+    return stream.getvalue()
+
+
+# patching Markdown
+Markdown.output_formats["plain"] = unmark_element
+__md = Markdown(output_format="plain")
+__md.stripTopLevelTags = False
+
+
+def remove_markdown(text: str):
+    """Converts markdown formatting to plain text.
+
+    Note: The Markdown instance needs to be reset between calls to avoid
+    state leaking between conversions.
+    """
+    __md.reset()
+    return __md.convert(text)
+
+
+def cleanup_text(text: str, language: SpokenLanguage = SpokenLanguage.EN):
+    """Cleans up text for TTS playback.
+
+    Removes/transforms elements that don't work well with text-to-speech:
+    - Removes code blocks (``` ... ```)
+    - Removes tables entirely
+    - Converts short lists to natural speech enumerations
+    - Strips long lists per list block
+    - Extracts link text from Markdown links [text](url) → text
+    - Removes standalone URLs
+    - Removes remaining Markdown formatting
+    - Removes actions between asterisks (*sighs*), keeps *emphasis* as a word
+    - Removes emojis
+
+    Args:
+        text (str): The raw text from LLM response.
+        language: The language it is spoken in, for the "and" of a list.
+
+    Returns:
+        tuple: (cleaned_text, contains_links, contains_code_blocks)
+    """
+    # Remove code blocks first (before any text processing)
+    text, contains_code_blocks = remove_code_blocks(text)
+    # Remove tables entirely — they never sound good in TTS
+    text = remove_tables(text)
+    # Convert lists to natural speech (or strip if too long)
+    text = convert_lists_for_tts(text, _LIST_AND.get(language))
+    # Extract link text from Markdown links before removing markdown
+    text = extract_markdown_link_text(text)
+    # Actions between asterisks, before Markdown turns them into italics
+    text = remove_action_emotes(text)
+    # Remove remaining markdown formatting (bold, italic, headers, etc.)
+    text = remove_markdown(text)
+    # Remove standalone URLs (Markdown link URLs already handled above)
+    text, contains_links = remove_links(text)
+    # Remove emote text between asterisks
+    text = remove_emote_text(text)
+    # Remove emojis
+    text = remove_emojis(text)
+    # Clean up extra whitespace that may result from removals
+    text = re.sub(r"[ \t]+", " ", text)  # collapse horizontal whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)  # collapse excessive newlines
+    text = strip_edge_breaks(text)
+    text = text.strip()
+
+    return text, contains_links, contains_code_blocks
+
+
+_EDGE_BREAK_RE = re.compile(
+    r"^(?:\s*<break\s+time=\"[^\"]*\"\s*/?>\s*)+|(?:\s*<break\s+time=\"[^\"]*\"\s*/?>\s*)+$",
+    re.IGNORECASE,
+)
+
+
+def strip_edge_breaks(text: str) -> str:
+    """Drop TTS pause tags at the very start or end of a reply.
+
+    A pause is only heard as a pause between two sentences. At the start it is
+    a reply that arrives late; at the end it is dead air before the next turn.
+    The prompt says so too, but a model that ignores it must not reach the
+    engine.
+    """
+    return _EDGE_BREAK_RE.sub("", text)
+
+
+# <break time="400ms" />, <verbatim>, </verbatim>, and <sigh> written wrongly.
+_SPEECH_TAG = r"<(?:break\b[^<>]*|/?[a-z]+)\s*/?>"
+# Wraps a word that stays: only the tag goes, the spaces around it stay.
+_VERBATIM_RE = re.compile(r"</?verbatim\s*>", re.IGNORECASE)
+# [sigh], [laughs softly]: lowercase words in brackets. Not a Markdown link
+# "[text](url)" or "[text][ref]", not "[x]" of a task list, not "[1]" or "[SCU]".
+_STAGE_DIRECTION = r"(?<!\])\[[a-z][a-z ]{2,28}\](?![(\[])"
+_SPEECH_MARKUP = f"(?:{_SPEECH_TAG}|{_STAGE_DIRECTION})"
+_MARKUP_AT_LINE_START_RE = re.compile(rf"(?m)^([ \t]*){_SPEECH_MARKUP}[ \t]*")
+_MARKUP_RE = re.compile(rf"[ \t]*{_SPEECH_MARKUP}")
+# Code blocks and inline code are shown as written: <div> there is code
+_CODE_RE = re.compile(r"(```.*?(?:```|\Z)|`[^`\n]*`)", re.DOTALL)
+
+
+def display_text(text: str) -> str:
+    """The reply as it is read, without what only the voice needs.
+
+    Models write speech markup into replies for the TTS provider: pauses
+    (<break time="400ms" />), spelled-out names (<verbatim>L3</verbatim>) and
+    stage directions ([sigh], or <sigh> when they get it wrong). The client
+    renders those; the HUD showed them as typed. Everything else stays as
+    written, indentation, Markdown and code included.
+    """
+    if not text:
+        return text
+    # split() with a group: prose at even places, code at odd ones
+    parts = _CODE_RE.split(text)
+    for i in range(0, len(parts), 2):
+        # At the start of a line the space after the markup goes with it, the
+        # indentation before it stays; inside a line the space before it goes.
+        prose = _VERBATIM_RE.sub("", parts[i])
+        prose = _MARKUP_AT_LINE_START_RE.sub(r"\1", prose)
+        parts[i] = _MARKUP_RE.sub("", prose)
+    return "".join(parts).strip()

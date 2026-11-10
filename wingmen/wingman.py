@@ -1,0 +1,1670 @@
+"""Unified Wingman class.
+
+Merges the former base ``Wingman`` and its only subclass ``OpenAiWingman``
+into a single class that delegates to extracted services and provider
+interfaces for STT, TTS, and LLM.
+"""
+
+import json
+import re
+import time
+import asyncio
+import traceback
+import threading
+import concurrent.futures
+from copy import deepcopy
+from typing import (
+    Any,
+    Dict,
+    Optional,
+    TYPE_CHECKING,
+)
+import httpx
+from openai import APIConnectionError
+from openai.types.chat import ChatCompletion
+from api.interface import (
+    BenchmarkResult,
+    CommandConfig,
+    InputBinding,
+    SettingsConfig,
+    SkillConfig,
+    SoundConfig,
+    TokenUsage,
+    WingmanConfig,
+    WingmanInitializationError,
+)
+from api.enums import (
+    CommandTag,
+    ConversationProvider,
+    ImageAspect,
+    ImageGenerationProvider,
+    LogSource,
+    LogType,
+    TtsProvider,
+    WingmanInitializationErrorType,
+)
+from providers.interfaces import LlmInterface, TtsInterface
+from services.audio.vocabulary_tools import VOCABULARY_TOOLS
+from services.hud_service import HudService
+from services.hud_tools import HUD_TOOLS, run_hud_tool
+from services.audio_player import AudioPlayer
+from services.benchmark import Benchmark
+from services.markdown import cleanup_text
+from services.secret_keeper import SecretKeeper
+from services import speech_text
+from services.printr import Printr
+from services.speech_priority import EVENT_WAIT_S, SpeechPriority, SpeechSlot, current_speech, must_yield
+from services.user_activity import user_activity
+from services.websocket_user import WebSocketUser
+from services.audio_library import AudioLibrary
+from services.context_budget import (
+    SUBSCRIPTION_MAX_REQUEST_CHARS,
+    ContextBudget,
+    ContextOverflowError,
+    learn_window,
+    model_window,
+)
+from services.conversation_manager import ConversationManager
+from services.token_utils import count_tokens
+from services.conversation_condenser import ConversationCondenser
+from services.context_builder import ContextBuilder
+from services.command_executor import CommandExecutor
+from services.tool_executor import ToolExecutor
+from services.provider_factory import ProviderFactory
+from services.skill_registry import SkillRegistry
+from services.threading_utils import threaded_execution
+from services.mcp_client import McpClient
+from services.capability_registry import CapabilityRegistry
+from services.wingman_mcp_manager import WingmanMcpManager
+from services.wingman_skill_manager import WingmanSkillManager, _get_skill_folder_from_module
+from services.turn_metrics import TurnMetrics
+from services.filler_response import FillerLine, FillerResponder
+from services.decision_gate import DecisionGate
+from skills.skill_base import Skill
+
+if TYPE_CHECKING:
+    from services.tower import Tower
+
+printr = Printr()
+
+# A tag like <｜tool_call｜> or <#INVALID#>. Asked for words with tool_choice
+# "none", some models still call a tool and write the call out in their own
+# tokens. "3 < 5" and "<10%, >80%" are no tag: a space or a digit after "<".
+TOOL_MARKUP = re.compile(r"<[^\s<>\d][^<>\n]{0,80}>")
+# Tags a spoken answer may have, the prompt asks for them: pauses
+# (<break time="400ms" />), spelled-out codes (<verbatim>3B</verbatim>) and
+# <sigh> for [sigh]. A closing tag other than </verbatim> is none of them.
+SPEECH_MARKUP = re.compile(r"<(?:(?i:break\b[^<>]*|/?verbatim\s*)|[a-z]+)>")
+
+
+def tool_names(tool_calls) -> list[str]:
+    """The names of the tools a model answer calls, in order."""
+    names = []
+    for call in tool_calls or []:
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        if name:
+            names.append(name)
+    return names
+
+
+_duplicate_tools_reported: set[str] = set()
+
+
+def unique_tools(tools: list[dict]) -> list[dict]:
+    """One definition per function name. Two skills can register the same names (a bundled
+    skill and an old custom copy of it); providers reject a request that lists a name twice.
+    Calls are routed by name to one skill anyway."""
+    seen = set()
+    unique = []
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name") if isinstance(tool, dict) else None
+        if name in seen:
+            if name not in _duplicate_tools_reported:
+                _duplicate_tools_reported.add(name)
+                printr.print(
+                    f"Tool '{name}' is provided twice (e.g. by a skill and a copy of it), using one.",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+            continue
+        if name:
+            seen.add(name)
+        unique.append(tool)
+    return unique
+
+
+class Wingman:
+    """Unified Wingman class.
+
+    Handles lifecycle, process loop, audio, command execution, config
+    save/load, skill management, provider routing, conversation management,
+    tool execution, context building, and condensation.
+
+    Providers are resolved via :class:`ProviderFactory` into two interface
+    slots: ``tts`` and ``llm``. Speech-to-text is not a wingman concern: the
+    core transcribes with the provider from Settings and hands in the text.
+    Heavy orchestration logic is delegated to extracted service objects.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: WingmanConfig,
+        settings: SettingsConfig,
+        audio_player: AudioPlayer,
+        audio_library: AudioLibrary,
+        xvasynth=None,
+        pocket_tts=None,
+        tower: "Tower" = None,
+        settings_service=None,
+    ):
+        self.config = config
+        self.settings = settings
+        self.name = name
+        self.audio_player = audio_player
+        self.audio_library = audio_library
+        self.tower = tower
+        # Used by the sanctioned ctx.audio.set_output_device capability (in-process,
+        # replacing AudioDeviceChanger's HTTP-to-localhost hack). May be None in tests.
+        self.settings_service = settings_service
+
+        self.secret_keeper = SecretKeeper()
+        self.secret_keeper.secret_events.subscribe(
+            "secrets_saved", self.handle_secret_saved
+        )
+
+        # Shared provider singletons (passed from Tower)
+        self._shared_providers = {
+            "xvasynth": xvasynth,
+            "pocket_tts": pocket_tts,
+        }
+
+        # --- Provider interface slots (populated by validate → ProviderFactory) ---
+        self.tts: TtsInterface | None = None
+        # Words the local speech decoder is nudged towards while this wingman
+        # runs. Skills add them through ctx.stt; the core reads them when it
+        # transcribes. Runtime only, never saved.
+        self.stt_hotwords: list[str] = []
+        self.llm: LlmInterface | None = None
+
+        # --- Extracted services ---
+        self.conversation = ConversationManager(config, settings, name)
+        self.condenser = ConversationCondenser(self.conversation, config, name)
+        self.context_builder = ContextBuilder(config, settings, name)
+        self.tool_executor = ToolExecutor(
+            config, settings, name, budget_fn=lambda: self.context_budget
+        )
+        # The shared HUD: the conversation in the chat container, info panel tools
+        self.conversation.message_listeners.append(self._show_on_hud)
+        self.tool_executor.hud_tool_runner = (
+            lambda function_name, args: run_hud_tool(self, function_name, args)
+        )
+        self.command_executor = CommandExecutor(
+            config=config,
+            audio_library=audio_library,
+            wingman_name=name,
+            on_reset_history=self.reset_conversation_history,
+            on_add_forced_commands=self.conversation.add_forced_assistant_command_calls,
+            on_execute_skill_action=self.execute_skill_command_action,
+        )
+
+        # --- Metrics service ---
+        self.metrics = TurnMetrics(
+            wingman_name=name,
+            config=config,
+            conversation=self.conversation,
+        )
+
+        self.execution_start: None | float = None
+
+        # --- Skills ---
+        self.skill_registry = SkillRegistry()
+        self.skill_manager = WingmanSkillManager(
+            wingman=self,
+            config=config,
+            settings=settings,
+            skill_registry=self.skill_registry,
+        )
+
+        # --- MCP ---
+        self.mcp_client = McpClient(wingman_name=self.name)
+        self.mcp_manager = WingmanMcpManager(
+            wingman_name=self.name,
+            mcp_client=self.mcp_client,
+            secret_keeper=self.secret_keeper,
+            get_mcp_config=lambda: self.tower.config_manager.mcp_config if self.tower else None,
+            settings=self.settings,
+            config=self.config,
+        )
+
+        # --- Unified capability registry ---
+        self.capability_registry = CapabilityRegistry(
+            self.skill_registry, self.mcp_registry
+        )
+
+        # --- Local AI / persistent memory ---
+        self.local_ai_service = None
+        self.persistent_memory_service = None
+        # Tasks of the main loop, or futures of work handed to it from a
+        # turn's own loop.
+        self._background_tasks: set[asyncio.Task | concurrent.futures.Future] = set()
+        # Memory checkpoints: what was said since the last one, how many user
+        # turns that is, when it ran, and the idle timer that closes a session.
+        self._memory_pending: list[dict] = []
+        self._memory_turns = 0
+        self._memory_last_checkpoint = time.time()
+        self._memory_idle_handle: asyncio.TimerHandle | None = None
+        # Set by unload(): a turn still running when the Wingman is switched
+        # off neither speaks nor writes to memory.
+        self._unloaded = False
+
+        # --- Image generation (lazy) ---
+        self._image_subscription = None
+        self._learned_window: int | None = None
+        """The main model's window as learned from an overflow; None until then.
+        Reset when the config changes, since the model may have changed."""
+
+        # --- Filler line while a turn with tools runs (settings.filler_responses) ---
+        self.filler = FillerResponder(
+            settings=self.settings,
+            get_local_ai=lambda: self.local_ai_service,
+            speak=self._speak_filler,
+        )
+        self._turn_filler: FillerLine | None = None
+
+        # --- Conversation state ---
+        self.last_gpt_call = None
+
+        # --- System One decisions (settings.decision_model.enabled) ---
+        self.decision_gate = DecisionGate(wingman_name=name, settings=settings)
+
+    # ──────────────────────────────── Backward-compat properties ──────────────── #
+
+    @property
+    def mcp_registry(self):
+        """Backward-compat: many callers access wingman.mcp_registry directly."""
+        return self.mcp_manager.mcp_registry
+
+    @property
+    def skills(self):
+        return self.skill_manager.skills
+
+    @property
+    def tool_skills(self):
+        return self.skill_manager.tool_skills
+
+    @property
+    def skill_tools(self):
+        return self.skill_manager.skill_tools
+
+    # ──────────────────────────────── Record keys ─────────────────────────────── #
+
+    def get_record_bindings(self) -> list[InputBinding]:
+        return self.config.record_bindings
+
+    # ──────────────────────────────── Secrets ──────────────────────────────────── #
+
+    async def handle_secret_saved(self, _secrets: Dict[str, Any]):
+        await printr.print_async(
+            text="Secret saved",
+            source_name=self.name,
+            command_tag=CommandTag.SECRET_SAVED,
+        )
+        await self.validate()
+
+    async def retrieve_secret(self, secret_name, errors, is_required=True):
+        try:
+            api_key = await self.secret_keeper.retrieve(
+                requester=self.name,
+                key=secret_name,
+                prompt_if_missing=is_required,
+            )
+            if not api_key and is_required:
+                errors.append(
+                    WingmanInitializationError(
+                        wingman_name=self.name,
+                        message=f"Missing secret '{secret_name}'.",
+                        error_type=WingmanInitializationErrorType.MISSING_SECRET,
+                        secret_name=secret_name,
+                    )
+                )
+        except Exception as e:
+            printr.print(
+                f"Error retrieving secret '{secret_name}': {e}",
+                color=LogType.ERROR,
+                server_only=True,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            errors.append(
+                WingmanInitializationError(
+                    wingman_name=self.name,
+                    message=f"Could not retrieve secret '{secret_name}': {str(e)}",
+                    error_type=WingmanInitializationErrorType.MISSING_SECRET,
+                    secret_name=secret_name,
+                )
+            )
+            api_key = None
+
+        return api_key
+
+    # ──────────────────────────────── Validate ─────────────────────────────────── #
+
+    async def validate(self) -> list[WingmanInitializationError]:
+        errors: list[WingmanInitializationError] = []
+
+        try:
+            factory = ProviderFactory(
+                config=self.config,
+                settings=self.settings,
+                secret_keeper=self.secret_keeper,
+                shared_providers=self._shared_providers,
+                wingman_name=self.name,
+            )
+            self.tts = await factory.create_tts(errors)
+            self.llm = await factory.create_llm(errors)
+        except httpx.InvalidURL as e:
+            # An endpoint the user typed in, like "localhost:1234:1234". Theirs
+            # to correct in the settings, so a warning and not an error report.
+            message = f"Invalid server address in the provider settings: {e}."
+            errors.append(
+                WingmanInitializationError(
+                    wingman_name=self.name,
+                    message=message,
+                    error_type=WingmanInitializationErrorType.INVALID_CONFIG,
+                )
+            )
+            printr.print(message, color=LogType.WARNING, server_only=True)
+        except Exception as e:
+            errors.append(
+                WingmanInitializationError(
+                    wingman_name=self.name,
+                    message=f"Error during provider validation: {str(e)}",
+                    error_type=WingmanInitializationErrorType.UNKNOWN,
+                )
+            )
+            printr.print(
+                f"Error during provider validation: {str(e)}",
+                color=LogType.ERROR,
+                server_only=True,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+
+        return errors
+
+    # ──────────────────────────────── Lifecycle ─────────────────────────────────── #
+
+    async def unload(self):
+        self._unloaded = True
+        # A filler line not out yet stays unsaid.
+        if getattr(self, "_turn_filler", None) is not None:
+            self._stop_turn_filler(learn=False)
+        # Wait for any background memory extraction tasks to finish. A task
+        # of another loop cannot be awaited here; work handed to the main
+        # loop from a turn's loop is a concurrent future and can.
+        pending, self._background_tasks = list(self._background_tasks), set()
+        loop = asyncio.get_running_loop()
+        waits = []
+        for task in pending:
+            if isinstance(task, concurrent.futures.Future):
+                waits.append(asyncio.wrap_future(task))
+            elif task.get_loop() is loop:
+                waits.append(task)
+        if waits:
+            await asyncio.gather(*waits, return_exceptions=True)
+
+        if self.persistent_memory_service:
+            await self._memory_checkpoint(final=True)
+            self.persistent_memory_service.close()
+            self.persistent_memory_service = None
+
+        # Unsubscribe from secret events to prevent duplicate handlers
+        self.secret_keeper.secret_events.unsubscribe(
+            "secrets_saved", self.handle_secret_saved
+        )
+        await self.unload_skills()
+
+    async def unload_skills(self):
+        return await self.skill_manager.unload_skills()
+
+    async def unload_mcps(self):
+        return await self.mcp_manager.unload_mcps()
+
+    # ──────────────────────────────── Memory ──────────────────────────────────── #
+
+    def ensure_memory_initialized(self) -> bool:
+        if self._unloaded:
+            return False
+        if self.persistent_memory_service and not self.config.persistent_memory:
+            self.persistent_memory_service.close()
+            self.persistent_memory_service = None
+            return False
+        if self.persistent_memory_service:
+            return True
+        if self.config.persistent_memory and self.local_ai_service:
+            from services.persistent_memory import PersistentMemoryService
+
+            self.persistent_memory_service = PersistentMemoryService(
+                wingman_name=self.name,
+                local_ai_service=self.local_ai_service,
+            )
+            self.persistent_memory_service.initialize()
+            return True
+        return False
+
+    def _memory_after_turn(self, response) -> None:
+        """Count the turn, keep the reply, run a checkpoint when it is time,
+        and re-arm the idle timer that closes the session."""
+        if self._unloaded or not self.persistent_memory_service:
+            return
+        from services.persistent_memory import CHECKPOINT_SECONDS, CHECKPOINT_TURNS
+
+        if response:
+            self._memory_pending.append({"role": "assistant", "content": str(response)})
+        self._memory_turns += 1
+        due = (
+            self._memory_turns >= CHECKPOINT_TURNS
+            or time.time() - self._memory_last_checkpoint >= CHECKPOINT_SECONDS
+        )
+        if due:
+            self._memory_in_background(self._memory_checkpoint(final=False))
+
+        main_loop = self._memory_loop()
+        if main_loop is asyncio.get_running_loop():
+            self._memory_arm_idle()
+        else:
+            main_loop.call_soon_threadsafe(self._memory_arm_idle)
+
+    @staticmethod
+    def _memory_loop() -> asyncio.AbstractEventLoop:
+        """The loop memory work runs on. A turn may run on a throwaway loop
+        in a worker thread that is closed once the answer is out; a
+        checkpoint or idle timer left there would be lost. So it is the main
+        loop whenever that runs."""
+        main_loop = WebSocketUser._main_loop
+        if main_loop is not None and main_loop.is_running():
+            return main_loop
+        return asyncio.get_running_loop()
+
+    def _memory_in_background(self, coro) -> None:
+        main_loop = self._memory_loop()
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if main_loop is running_loop:
+            task = main_loop.create_task(coro)
+        else:
+            task = asyncio.run_coroutine_threadsafe(coro, main_loop)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _memory_arm_idle(self) -> None:
+        """(Re-)start the idle timer, on the loop memory work runs on."""
+        from services.persistent_memory import IDLE_SECONDS
+
+        if self._unloaded:
+            return
+        if self._memory_idle_handle:
+            self._memory_idle_handle.cancel()
+        self._memory_idle_handle = asyncio.get_running_loop().call_later(
+            IDLE_SECONDS, self._memory_idle
+        )
+
+    def _memory_idle(self) -> None:
+        """No user turn for IDLE_SECONDS: the session is over."""
+        self._memory_idle_handle = None
+        self._memory_in_background(self._memory_checkpoint(final=True))
+
+    async def _memory_checkpoint(self, final: bool) -> None:
+        """Hand what was said since the last checkpoint to memory.
+
+        ``final`` closes the episode and starts a new session; the next
+        build of the system prompt says again what was loaded. The condensed
+        summary goes along only at the end: the messages it covers were
+        already seen by the checkpoints before, the rewrite folds them in.
+        """
+        svc = self.persistent_memory_service
+        if not svc:
+            return
+        pending, self._memory_pending = self._memory_pending, []
+        self._memory_turns = 0
+        self._memory_last_checkpoint = time.time()
+        if final and self._memory_idle_handle:
+            self._memory_idle_handle.cancel()
+            self._memory_idle_handle = None
+        if not pending and not final:
+            return
+        try:
+            summary = self.conversation.conversation_summary if final else ""
+            outcome = await svc.checkpoint(pending, conversation_summary=summary, final=final)
+            if outcome.get("changed") or outcome.get("episode"):
+                printr.print(
+                    f"Memory checkpoint for {self.name}: {outcome['before']} → {outcome['after']} facts"
+                    + (", episode updated" if outcome.get("episode") else "")
+                    + (" (session closed)" if final else "") + ".",
+                    color=LogType.MEMORY,
+                    server_only=True,
+                )
+        except Exception as e:
+            printr.print(
+                f"Memory checkpoint for {self.name} failed: {e}",
+                color=LogType.WARNING,
+                server_only=True,
+            )
+        if final:
+            self.context_builder.reset_memory_notification()
+
+    # ──────────────────────────────── MCP (forwarding) ─────────────────────────── #
+
+    async def enable_mcp(self, mcp_name: str) -> tuple[bool, str]:
+        return await self.mcp_manager.enable_mcp(mcp_name)
+
+    async def disable_mcp(self, mcp_name: str) -> tuple[bool, str]:
+        return await self.mcp_manager.disable_mcp(mcp_name)
+
+    async def init_mcps(self) -> list[WingmanInitializationError]:
+        return await self.mcp_manager.init_mcps()
+
+    # ──────────────────────────────── Skills (forwarding) ─────────────────────── #
+
+    async def init_skills(self) -> list[WingmanInitializationError]:
+        return await self.skill_manager.init_skills()
+
+    async def enable_skill(self, skill_name: str) -> tuple[bool, str]:
+        return await self.skill_manager.enable_skill(skill_name)
+
+    async def disable_skill(self, skill_name: str) -> tuple[bool, str]:
+        return await self.skill_manager.disable_skill(skill_name)
+
+    # ──────────────────────────── The main processing loop ──────────────────────── #
+
+    async def process(
+        self,
+        transcript: str,
+        images: list[tuple[str, str]] = None,
+        transcription_benchmark: BenchmarkResult | None = None,
+    ):
+        """Answer what the user said. While this runs the user counts as busy
+        (services/user_activity.py): nothing a wingman says on its own may
+        land between the question and the answer."""
+        if self._unloaded:
+            # Its config was switched away from while the words were on
+            # their way here.
+            return
+        user_activity.turn_started()
+        try:
+            await self._process(transcript, images, transcription_benchmark)
+        finally:
+            user_activity.turn_finished()
+
+    async def _process(
+        self,
+        transcript: str,
+        images: list[tuple[str, str]] = None,
+        transcription_benchmark: BenchmarkResult | None = None,
+    ):
+        """Answer what the user said.
+
+        ``transcript`` is text already: typed in the chat or transcribed by the
+        core's STT service. ``transcription_benchmark`` is that service's timing,
+        shown next to the user's message like it was when transcription happened
+        here.
+        """
+        try:
+            process_result = None
+            interrupt = None
+            if transcript:
+                additional_data = None
+                if images:
+                    additional_data = {"images": [b64 for b64, _mime in images]}
+                await printr.print_async(
+                    f"{transcript}",
+                    color=LogType.USER,
+                    source_name="User",
+                    source=LogSource.USER,
+                    benchmark_result=transcription_benchmark,
+                    additional_data=additional_data,
+                )
+
+                benchmark_llm = Benchmark(label="Command/AI Processing")
+                answered = False
+                try:
+                    process_result, instant_response, skill, interrupt = (
+                        await self._get_response_for_transcript(
+                            transcript=transcript, benchmark=benchmark_llm, images=images
+                        )
+                    )
+                    answered = bool(process_result or instant_response)
+                finally:
+                    # The answer is ready: a filler line that is not out yet
+                    # is dropped; one that was spoken must not be cut off.
+                    # Only a turn that ended in an answer teaches the filler
+                    # how long the wait is; an error or a cancelled call ends
+                    # early and would make a slow tool look fast.
+                    if self._stop_turn_filler(learn=answered):
+                        interrupt = False
+                # Every path out of the turn passes here, including the ones
+                # that end early on a command. Skills add their own decisions
+                # to the same list on the way, so this is the whole layer.
+                self.metrics.add_system_one_snapshot(
+                    benchmark_llm, self.decision_gate.take_decisions()
+                )
+
+                actual_response = instant_response or process_result
+
+                if self._unloaded:
+                    # The config was switched while the model answered: the
+                    # answer belongs to a wingman the user left.
+                    return
+
+                if actual_response:
+                    await printr.print_async(
+                        f"{actual_response}",
+                        color=LogType.POSITIVE,
+                        source=LogSource.WINGMAN,
+                        source_name=self.name,
+                        skill_name=skill.name if skill else "",
+                        benchmark_result=benchmark_llm.finish(),
+                        token_usage=self.metrics.take_turn_usage(),
+                    )
+
+            if process_result:
+                if self.settings.streamer_mode:
+                    self.tower.save_last_message(self.name, process_result)
+                await self.play_to_user(str(process_result), not interrupt)
+            if transcript:
+                self._memory_after_turn(actual_response)
+        except Exception as e:
+            await printr.print_async(
+                f"Error during processing of Wingman '{self.name}': {str(e)}",
+                color=LogType.ERROR,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+
+    # ───────────────── Response orchestration ───────────────── #
+
+    async def _get_response_for_transcript(
+        self, transcript: str, benchmark: Benchmark, images: list[tuple[str, str]] = None
+    ) -> tuple[str | None, str | None, Skill | None, bool]:
+        self.ensure_memory_initialized()
+        self.metrics.start_turn_usage()
+
+        await self.add_user_message(transcript, images=images)
+
+        benchmark.start_snapshot("Instant activation commands")
+        instant_response, instant_command_executed = await self.command_executor.try_instant_activation(
+            transcript=transcript
+        )
+        if instant_response:
+            await self.conversation.add_assistant_message(instant_response)
+            benchmark.finish_snapshot()
+            if instant_response == ".":
+                instant_response = None
+            return instant_response, instant_response, None, True
+        benchmark.finish_snapshot()
+
+        # The same shape as instant activation above, one step less exact: the
+        # phrase list matches words, this matches meaning. A command with a
+        # written response ends the turn here without a main-model call at all;
+        # one without still needs the model for something to say, but no longer
+        # needs it to pick the command.
+        #
+        # No snapshot around this: the gate times every decision it takes,
+        # including the ones skills make later in the turn, and they are added
+        # together at the end.
+        if self.decision_gate.active and not instant_command_executed:
+            decided_executed, decided_response = await self._ask_decision_model_about_the_turn(transcript)
+            if decided_response:
+                await self.conversation.add_assistant_message(decided_response)
+                return decided_response, decided_response, None, True
+            instant_command_executed = instant_command_executed or decided_executed
+
+        llm_processing_time_ms = 0.0
+        tool_execution_time_ms = 0.0
+        tool_timings: list[tuple[str, float]] = []
+
+        llm_start = time.perf_counter()
+        completion = await self._llm_call(instant_command_executed is False)
+        llm_processing_time_ms += (time.perf_counter() - llm_start) * 1000
+
+        if completion is None:
+            self.metrics.add_benchmark_snapshot(
+                benchmark, "LLM Processing", llm_processing_time_ms
+            )
+            return None, None, None, True
+
+        response_message, tool_calls, usage = await self._process_completion(
+            completion, instant_command_executed is False
+        )
+
+        self.metrics.add_call_usage(usage, tool_names(tool_calls))
+        turn_prompt_tokens = usage.input_tokens
+        turn_completion_tokens = usage.output_tokens
+
+        is_waiting_response_needed, is_summarize_needed = await self.conversation.add_gpt_response(
+            response_message, tool_calls
+        )
+        interrupt = True
+
+        while tool_calls:
+            if is_waiting_response_needed and response_message.content:
+                if self._stop_turn_filler():
+                    interrupt = False
+                message = response_message.content
+                self.threaded_execution(self.play_to_user, message, not interrupt)
+                await printr.print_async(
+                    f"{message}",
+                    color=LogType.POSITIVE,
+                    source=LogSource.WINGMAN,
+                    source_name=self.name,
+                    skill_name="",
+                )
+                interrupt = False
+            else:
+                is_summarize_needed = True
+
+            # Nothing said yet in this turn: fill the wait until the answer is
+            # ready. It runs across rounds — activating a capability, the tool,
+            # the model writing the answer — and is stopped by the caller.
+            if interrupt and self._turn_filler is None:
+                self._turn_filler = await self._start_filler(transcript, tool_calls)
+
+            tool_start = time.perf_counter()
+            instant_response, skill, iteration_timings = await self._handle_tool_calls(
+                tool_calls
+            )
+            tool_execution_time_ms += (time.perf_counter() - tool_start) * 1000
+            tool_timings.extend(iteration_timings)
+
+            if instant_response:
+                self.metrics.add_benchmark_snapshot(
+                    benchmark, "LLM Processing", llm_processing_time_ms
+                )
+                if tool_execution_time_ms > 0:
+                    self.metrics.add_tool_execution_snapshot(
+                        benchmark, tool_execution_time_ms, tool_timings
+                    )
+                await self.metrics.broadcast_token_usage(
+                    turn_prompt_tokens, turn_completion_tokens
+                )
+                return None, instant_response, None, interrupt
+
+            if is_summarize_needed:
+                llm_start = time.perf_counter()
+                completion = await self._llm_call(True)
+                llm_processing_time_ms += (time.perf_counter() - llm_start) * 1000
+
+                if completion is None:
+                    self.metrics.add_benchmark_snapshot(
+                        benchmark, "LLM Processing", llm_processing_time_ms
+                    )
+                    if tool_execution_time_ms > 0:
+                        self.metrics.add_tool_execution_snapshot(
+                            benchmark, tool_execution_time_ms, tool_timings
+                        )
+                    await self.metrics.broadcast_token_usage(
+                        turn_prompt_tokens, turn_completion_tokens
+                    )
+                    return None, None, None, True
+
+                response_message, tool_calls, usage = await self._process_completion(
+                    completion
+                )
+                self.metrics.add_call_usage(usage, tool_names(tool_calls))
+                turn_prompt_tokens = usage.input_tokens
+                turn_completion_tokens += usage.output_tokens
+
+                is_waiting_response_needed, is_summarize_needed = (
+                    await self.conversation.add_gpt_response(response_message, tool_calls)
+                )
+                if tool_calls:
+                    interrupt = False
+            elif is_waiting_response_needed:
+                self.metrics.add_benchmark_snapshot(
+                    benchmark, "LLM Processing", llm_processing_time_ms
+                )
+                if tool_execution_time_ms > 0:
+                    self.metrics.add_tool_execution_snapshot(
+                        benchmark, tool_execution_time_ms, tool_timings
+                    )
+                await self.metrics.broadcast_token_usage(
+                    turn_prompt_tokens, turn_completion_tokens
+                )
+                return None, None, None, interrupt
+
+
+        self.metrics.add_benchmark_snapshot(
+            benchmark, "LLM Processing", llm_processing_time_ms
+        )
+        if tool_execution_time_ms > 0:
+            self.metrics.add_tool_execution_snapshot(
+                benchmark, tool_execution_time_ms, tool_timings
+            )
+        await self.metrics.broadcast_token_usage(turn_prompt_tokens, turn_completion_tokens)
+        return response_message.content, response_message.content, None, interrupt
+
+    # ───────────────── LLM call ───────────────── #
+
+    async def actual_llm_call(self, messages, tools: list[dict] = None, tool_choice: str = "auto"):
+        if not self.llm:
+            await printr.print_async(
+                f"No LLM provider configured for wingman '{self.name}'.",
+                color=LogType.ERROR,
+                source=LogSource.WINGMAN,
+                source_name=self.name,
+            )
+            return None
+
+        try:
+            completion = await self.llm.ask(
+                messages=messages, tools=tools, tool_choice=tool_choice
+            )
+        except ContextOverflowError:
+            raise  # _llm_call learns the window and retries
+        except APIConnectionError as e:
+            provider = self.config.features.conversation_provider.value
+            cause = e.__cause__
+            detail = str(cause) if cause else str(e)
+            message = f"Could not connect to {provider}: {detail}"
+            await printr.print_async(
+                message,
+                color=LogType.ERROR,
+                source=LogSource.WINGMAN,
+                source_name=self.name,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            return None
+        except Exception as e:
+            await printr.print_async(
+                f"Error during LLM call: {str(e)}",
+                color=LogType.ERROR,
+                source=LogSource.WINGMAN,
+                source_name=self.name,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            return None
+
+        # Some providers answer without a single choice (a filtered or
+        # aborted response). Every caller reads choices[0].
+        if completion is not None and not getattr(completion, "choices", None):
+            provider = self.config.features.conversation_provider.value
+            await printr.print_async(
+                f"{provider} sent an empty answer. Please try again.",
+                color=LogType.WARNING,
+                source=LogSource.WINGMAN,
+                source_name=self.name,
+            )
+            return None
+
+        return completion
+
+    async def _llm_call(self, allow_tool_calls: bool = True):
+        thiscall = time.time()
+        self.last_gpt_call = thiscall
+
+        # Without tool calls the tools still go along, with tool_choice
+        # "none": they come first in the request, and leaving them out made
+        # every answer after an instant command a full cache miss.
+        tools = self.build_tools()
+        tool_choice = "auto" if allow_tool_calls else "none"
+
+        if self.settings.debug_mode:
+            await printr.print_async(
+                f"Calling LLM with {len(self.conversation.messages)} messages (excluding context) and {len(tools) if tools else 0} tools.",
+                color=LogType.INFO,
+            )
+
+        messages = self.conversation.messages.copy()
+        await self.add_context(messages)
+        messages = await self._fit_request(messages, tools)
+
+        try:
+            completion = await self.actual_llm_call(messages, tools, tool_choice)
+        except ContextOverflowError as error:
+            # The provider says the window is smaller than we assumed. Learn it
+            # from the request that did not fit, shorten, and try once more.
+            request_tokens = self._request_tokens(messages, tools)
+            self._learned_window = learn_window(request_tokens)
+            await printr.print_async(
+                f"The model refused a request of ~{request_tokens:,} tokens as too long "
+                f"({error}). Wingman now assumes a window of "
+                f"~{self._learned_window:,} tokens for it and retries.",
+                color=LogType.WARNING,
+                source=LogSource.WINGMAN,
+                source_name=self.name,
+            )
+            messages = self.conversation.messages.copy()
+            await self.add_context(messages)
+            messages = await self._fit_request(messages, tools)
+            try:
+                completion = await self.actual_llm_call(messages, tools, tool_choice)
+            except ContextOverflowError as again:
+                await printr.print_async(
+                    f"The model refused the shortened request too: {again}",
+                    color=LogType.ERROR,
+                    source=LogSource.WINGMAN,
+                    source_name=self.name,
+                )
+                return None
+
+        if self.last_gpt_call != thiscall:
+            await printr.print_async(
+                "LLM call was cancelled due to a new call.", color=LogType.WARNING
+            )
+            return None
+
+        return completion
+
+    @property
+    def context_budget(self) -> ContextBudget:
+        """What this wingman may send, from its main model's window. See
+        services/context_budget.py."""
+        return ContextBudget(
+            model_window(
+                self.config,
+                reported=getattr(self.llm, "context_window", None),
+                learned=self._learned_window,
+            )
+        )
+
+    @staticmethod
+    def _request_tokens(messages: list, tools: list | None) -> int:
+        text = sum(
+            count_tokens(ConversationManager.message_text(m)) for m in messages
+        )
+        return text + (count_tokens(json.dumps(tools)) if tools else 0)
+
+    async def _fit_request(self, messages: list, tools: list | None) -> list:
+        """The brake: drop the oldest whole turns while a request is over what
+        the model can take.
+
+        The model's window is the limit (``ContextBudget.brake``), and on the
+        subscription also the backend's 400 KB, past which it refuses the
+        conversation. Below both nothing happens. With condensation on the
+        history limit keeps requests far below this; with it off this is the
+        only thing that shortens the history.
+        """
+        budget = self.context_budget
+        excess_tokens = self._request_tokens(messages, tools) - budget.brake
+        excess_chars = 0
+        if (
+            self.config.features.conversation_provider
+            == ConversationProvider.WINGMAN_PRO
+        ):
+            size = sum(ConversationManager.message_chars(m) for m in messages)
+            excess_chars = size - SUBSCRIPTION_MAX_REQUEST_CHARS
+        if excess_tokens <= 0 and excess_chars <= 0:
+            return messages
+
+        removed = 0
+        if excess_tokens > 0:
+            removed += self.conversation.drop_oldest_turns(
+                excess_tokens,
+                size_of=lambda m: count_tokens(ConversationManager.message_text(m)),
+            )
+        if excess_chars > 0:
+            removed += self.conversation.drop_oldest_turns(excess_chars)
+        if not removed:
+            return messages
+
+        limit = (
+            "the size limit of the Wingman subscription"
+            if excess_chars > 0
+            else f"what the model can take (~{budget.brake:,} tokens)"
+        )
+        await printr.print_async(
+            f"The conversation reached {limit}. The {removed} oldest messages "
+            f"were removed from the history.",
+            color=LogType.WARNING,
+            source=LogSource.WINGMAN,
+            source_name=self.name,
+        )
+        messages = self.conversation.messages.copy()
+        await self.add_context(messages)
+        return messages
+
+    async def _process_completion(
+        self, completion: ChatCompletion, allow_tool_calls: bool = True
+    ):
+        response_message = completion.choices[0].message
+
+        content = response_message.content
+        if content is None:
+            response_message.content = ""
+
+        if not allow_tool_calls:
+            response_message.tool_calls = None
+            # A tool call written out as text is no answer. Spoken, it is
+            # noise; kept in the history, the next answer copies it.
+            if TOOL_MARKUP.search(SPEECH_MARKUP.sub("", response_message.content)):
+                printr.print(
+                    f"{self.name}: dropped an answer that was a tool call written as text: "
+                    f"{response_message.content[:200]!r}",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+                response_message.content = ""
+
+        if response_message.tool_calls:
+            response_message.tool_calls = await self.tool_executor.fix_tool_calls(
+                response_message.tool_calls, self.command_executor.get_command
+            )
+
+        usage = TokenUsage(input_tokens=0, cached_tokens=0, output_tokens=0)
+        if completion.usage:
+            details = getattr(completion.usage, "prompt_tokens_details", None)
+            usage = TokenUsage(
+                input_tokens=completion.usage.prompt_tokens or 0,
+                cached_tokens=(details.cached_tokens or 0) if details else 0,
+                output_tokens=completion.usage.completion_tokens or 0,
+            )
+
+        return (
+            response_message,
+            response_message.tool_calls,
+            usage,
+        )
+
+    # ───────────────── Tool calls ───────────────── #
+
+    async def _handle_tool_calls(self, tool_calls):
+        return await self.tool_executor.handle_tool_calls(
+            tool_calls,
+            tool_skills=self.tool_skills,
+            skill_registry=self.skill_registry,
+            mcp_registry=self.mcp_registry,
+            capability_registry=self.capability_registry,
+            persistent_memory_service=self.persistent_memory_service,
+            settings_service=self.settings_service,
+            get_command_fn=self.command_executor.get_command,
+            execute_command_fn=self.command_executor.execute_command,
+            play_to_user_fn=self.play_to_user,
+            update_tool_response_fn=self.conversation.update_tool_response,
+            add_tool_response_fn=self.conversation.add_tool_response,
+            pending_tool_calls=self.conversation.pending_tool_calls,
+        )
+
+    async def _start_filler(self, transcript: str, tool_calls) -> FillerLine | None:
+        """Start the filler line for the rest of this turn, if it applies.
+
+        Immediate when a tool's skill asks for a waiting response; otherwise
+        only once the turn has gone on for ``FILLER_DELAY_S``.
+        """
+        names = []
+        immediate = False
+        for tc in tool_calls:
+            name = tc.function.name if tc.function else None
+            if not name:
+                continue
+            if name.startswith("activate_"):
+                # "activate mcp server" tells the model nothing; what is being
+                # activated does ("wingman_starhead").
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except (TypeError, ValueError):
+                    args = {}
+                name = (
+                    args.get("capability_name") or args.get("server_name")
+                    or args.get("skill_name") or name
+                )
+            names.append(name)
+            skill = self.tool_skills.get(tc.function.name)
+            if skill and await skill.is_waiting_response_needed(tc.function.name):
+                immediate = True
+        if not names:
+            return None
+        return self.filler.start(
+            request=transcript,
+            tool_names=names,
+            immediate=immediate,
+            name=self.name,
+            backstory=self.config.prompts.backstory or "",
+        )
+
+    def _stop_turn_filler(self, learn: bool = True) -> bool:
+        """Stop this turn's filler line. True if it was spoken."""
+        line, self._turn_filler = self._turn_filler, None
+        return self.filler.stop(line, learn=learn)
+
+    def _speak_filler(self, line: str) -> None:
+        """Runs on the filler's thread: speech gets its own thread, the message
+        is handed to the main loop by ``printr.print``."""
+        if self._unloaded:
+            return
+        self.threaded_execution(self.play_to_user, line, False)
+        printr.print(
+            line,
+            color=LogType.FILLER,
+            source=LogSource.WINGMAN,
+            source_name=self.name,
+            wingman_name=self.name,
+        )
+
+    async def _ask_decision_model_about_the_turn(self, transcript: str) -> tuple[bool, str | None]:
+        """Ask which command the request means, and run it if the answer holds."""
+        name = await self.decision_gate.pick_command(
+            transcript, self.command_executor.eligible_commands()
+        )
+        if not name:
+            return False, None
+        return await self._run_decided_command(name)
+
+    async def _run_decided_command(self, name: str) -> tuple[bool, str | None]:
+        """Run the command the System One model picked.
+
+        Returns ``(executed, spoken_response)``. ``executed`` without a
+        response means the keypress happened but the command has no written
+        response, so the main model is still asked for something to say —
+        with tools switched off, exactly as after an instant activation.
+
+        The executed command is written into the history as the assistant's
+        own tool call, the same way instant activation does it. Without that,
+        the model's next turn has no idea the landing gear is down.
+        """
+        command = self.command_executor.get_command(name)
+        if not command:
+            # A command that vanished between the question and the answer.
+            return False, None
+
+        instant_response, _function_response = await self.command_executor.execute_command(
+            command, is_instant=True
+        )
+        await self.conversation.add_forced_assistant_command_calls([command])
+        return True, instant_response or None
+
+    async def execute_command_by_function_call(
+        self, function_name: str, function_args: dict[str, Any]
+    ) -> tuple[str, str | None, Skill | None, str | None]:
+        """Public API kept for backward compatibility with skills."""
+        return await self.tool_executor.execute_by_function_call(
+            function_name,
+            function_args,
+            tool_skills=self.tool_skills,
+            skill_registry=self.skill_registry,
+            mcp_registry=self.mcp_registry,
+            capability_registry=self.capability_registry,
+            persistent_memory_service=self.persistent_memory_service,
+            settings_service=self.settings_service,
+            get_command_fn=self.command_executor.get_command,
+            execute_command_fn=self.command_executor.execute_command,
+            play_to_user_fn=self.play_to_user,
+        )
+
+    async def execute_skill_command_action(
+        self, skill_name: str, function_name: str, parameters: dict
+    ) -> tuple[str, str]:
+        """Invoke a skill's @command_action. Returns (function_response, instant_response).
+        Returns ('', '') if the skill isn't active or the function is unknown."""
+        skill = self.skill_manager.command_action_skills.get((skill_name, function_name))
+        if not skill:
+            return "", ""
+        return await skill.execute_command_action(function_name, parameters)
+
+    # ───────────────── Conversation delegation ───────────────── #
+
+    async def add_user_message(self, content: str, images: list[tuple[str, str]] = None):
+        """Delegates to ConversationManager and keeps the message for the next
+        memory checkpoint."""
+        self._memory_pending.append({"role": "user", "content": content})
+        await self.conversation.add_user_message(
+            content,
+            images=images,
+            condense_fn=lambda: self.condenser.maybe_condense(
+                self.local_ai_service,
+                self.metrics.last_turn_prompt_tokens,
+                self.context_budget,
+            ),
+        )
+
+    async def reset_conversation_history(self):
+        if self.persistent_memory_service:
+            await self._memory_checkpoint(final=True)
+
+        await self.conversation.reset()
+        self.skill_registry.reset_activations()
+        self.mcp_registry.reset_activations()
+
+    def get_conversation_messages(self, strip_nulls: bool = True) -> list[dict]:
+        return self.conversation.get_conversation_messages(strip_nulls=strip_nulls)
+
+    # ─── Backward-compat: expose messages directly for skills/services that access it ─── #
+
+    @property
+    def messages(self) -> list:
+        return self.conversation.messages
+
+    @messages.setter
+    def messages(self, value: list):
+        self.conversation.messages = value
+
+    @property
+    def conversation_summary(self) -> str:
+        return self.conversation.conversation_summary
+
+    @conversation_summary.setter
+    def conversation_summary(self, value: str):
+        self.conversation.conversation_summary = value
+
+    @property
+    def pending_tool_calls(self) -> list:
+        return self.conversation.pending_tool_calls
+
+    @property
+    def _is_condensing(self) -> bool:
+        return self.condenser.is_condensing
+
+    # ───────────────── Avatar ───────────────── #
+
+    def get_avatar_path(self) -> Optional[str]:
+        """Resolve the local file path to this wingman's avatar image (PNG).
+
+        Falls back to the default Wingman AI avatar template if the user hasn't
+        set a custom one. Returns None if no Tower/ConfigManager is available
+        (e.g. in tests).
+        """
+        if not self.tower or not self.tower.config_manager or not self.tower.config_dir:
+            return None
+        try:
+            return self.tower.config_manager.get_wingman_avatar_path(
+                self.tower.config_dir, self.name
+            )
+        except Exception as e:
+            printr.print(
+                f"Could not resolve avatar path for wingman '{self.name}': {str(e)}",
+                color=LogType.WARNING,
+                server_only=True,
+            )
+            return None
+
+    # ───────────────── Context ───────────────── #
+
+    async def get_context(self):
+        config_dir_name = None
+        if self.tower and self.tower.config_dir and self.tower.config_dir.name:
+            config_dir_name = self.tower.config_dir.name
+
+        return await self.context_builder.build(
+            skills=self.skills,
+            skill_registry=self.skill_registry,
+            conversation_summary=self.conversation.conversation_summary,
+            persistent_memory_service=self.persistent_memory_service,
+            messages=self.conversation.messages,
+            config_dir_name=config_dir_name,
+        )
+
+    def get_last_context(self) -> str:
+        return self.context_builder.get_last_context()
+
+    async def add_context(self, messages):
+        """Put the system prompt in front."""
+        context = await self.get_context()
+        messages.insert(0, {"role": "system", "content": context})
+
+    # ───────────────── TTS / play_to_user ───────────────── #
+
+    async def play_to_user(
+        self,
+        text: str,
+        no_interrupt: bool = False,
+        sound_config: Optional[SoundConfig] = None,
+        priority: SpeechPriority = SpeechPriority.ANSWER,
+    ) -> bool:
+        """Say ``text``. True when it went to the speakers.
+
+        ``priority`` (services/speech_priority) decides who may talk over
+        whom. An EVENT waits for the user and for a playback at least as
+        important, also when that one started during synthesis, and is said
+        after it, up to EVENT_WAIT_S. A BACKGROUND line in that situation, or
+        one that would have to wait before synthesis, is not said at all."""
+        if self._unloaded:
+            return False
+        if sound_config:
+            printr.print(
+                "Using custom sound config for playback", LogType.INFO, server_only=True
+            )
+        else:
+            sound_config = self.config.sound
+
+        text, contains_links, contains_code_blocks = cleanup_text(
+            text, self.settings.spoken_language
+        )
+
+        deadline = time.monotonic() + EVENT_WAIT_S
+        if no_interrupt or priority != SpeechPriority.ANSWER:
+            if not await self._wait_for_turn(priority, deadline):
+                return False
+
+        changed_text = text
+        for skill in self.skills:
+            if skill.is_prepared:
+                changed_text = await skill.on_play_to_user(text, sound_config)
+                if changed_text != text:
+                    printr.print(
+                        f"Skill '{skill.config.display_name}' modified the text to: '{changed_text}'",
+                        LogType.INFO,
+                    )
+                    text = changed_text
+
+        # Written the way it is spoken: "Cptn." -> "Captain", "10 km" ->
+        # "zehn Kilometer", the user's own rules. Only what the voice reads;
+        # the chat already shows the answer as the Wingman wrote it.
+        pronunciation = self.settings.pronunciation
+        text = speech_text.prepare_for_speech(
+            text,
+            self.settings.spoken_language,
+            pronunciation.rules,
+            pronunciation.presets,
+            reads_numbers=self.config.features.tts_provider
+            in speech_text.VOICES_THAT_READ_NUMBERS,
+        )
+        # The listen controller compares short interruptions against this so
+        # the wingman saying "stop" does not stop itself - so it is what the
+        # speakers say, not what the chat shows.
+        self.audio_player.speaking_text = text
+
+        if sound_config.volume == 0.0:
+            printr.print(
+                "Volume modifier is set to 0. Skipping TTS processing.",
+                LogType.WARNING,
+                server_only=True,
+            )
+            return False
+
+        if "{SKIP-TTS}" in text:
+            printr.print(
+                "Skip TTS phrase found in input. Skipping TTS processing.",
+                LogType.WARNING,
+                server_only=True,
+            )
+            return False
+
+        if not self.tts:
+            printr.print(
+                f"No TTS provider configured for wingman '{self.name}'.",
+                LogType.WARNING,
+                server_only=True,
+            )
+            return False
+
+        slot = SpeechSlot(priority)
+        token = current_speech.set(slot)
+        try:
+            while True:
+                slot.yielded = False
+                await self.tts.play_audio(
+                    text=text,
+                    sound_config=sound_config,
+                    audio_player=self.audio_player,
+                    wingman_name=self.name,
+                )
+                if not slot.yielded:
+                    return True
+                # Something more important came first while this was
+                # synthesized. An event is said after it; radio is dropped.
+                if priority != SpeechPriority.EVENT:
+                    return False
+                if not await self._wait_for_turn(priority, deadline):
+                    return False
+        except Exception as e:
+            await printr.print_async(
+                f"Error during TTS playback: {str(e)}", color=LogType.ERROR
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            return False
+        finally:
+            current_speech.reset(token)
+
+    async def _wait_for_turn(self, priority: SpeechPriority, deadline: float) -> bool:
+        """Wait until a line of ``priority`` may start (see must_yield). An
+        answer waits only for another answer, the filler line before it.
+        False when the wingman was unloaded, the deadline passed, or a
+        BACKGROUND line would have to wait: it is said now or not at all."""
+        player = self.audio_player
+        while True:
+            if self._unloaded:
+                return False
+            if priority == SpeechPriority.ANSWER:
+                waiting = player.is_playing and player.playing_priority <= priority
+            else:
+                waiting = must_yield(
+                    priority, player.is_playing, player.playing_priority, user_activity.busy
+                )
+            if not waiting:
+                return True
+            # Background is said now or not at all. Waited for, it would come
+            # long after the moment it was about (chat read out after the answer).
+            if priority == SpeechPriority.BACKGROUND:
+                return False
+            if priority != SpeechPriority.ANSWER and time.monotonic() > deadline:
+                return False
+            await asyncio.sleep(0.1)
+
+    # ───────────────── Image generation ───────────────── #
+
+    async def generate_image(
+        self,
+        text: str,
+        aspect: ImageAspect = ImageAspect.SQUARE,
+        reference_images: Optional[list[str]] = None,
+    ) -> str:
+        """Returns the image as data URL or URL, "" on failure.
+        `reference_images` are data URLs, already shrunk for the backend."""
+        if (
+            self.config.features.image_generation_provider
+            != ImageGenerationProvider.WINGMAN_PRO
+        ):
+            return ""
+        try:
+            if self._image_subscription is None:
+                from providers.wingman_subscription import WingmanSubscription
+
+                self._image_subscription = WingmanSubscription(
+                    wingman_name=self.name, settings=self.settings.wingman_pro
+                )
+            return await self._image_subscription.generate_image(
+                text, aspect=aspect.value, images=reference_images
+            )
+        except Exception as e:
+            await printr.print_async(
+                f"Error during image generation: {str(e)}", color=LogType.ERROR
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+        return ""
+
+    # ───────────────── Build tools ───────────────── #
+
+    def build_tools(self) -> list[dict]:
+        """Assemble the full tool list for LLM calls."""
+        tools: list[dict] = []
+
+        command_tool = self.command_executor.get_tool_definition()
+        if command_tool:
+            tools.append(command_tool)
+
+        for _, tool in self.capability_registry.get_meta_tools():
+            tools.append(tool)
+
+        for _, tool in self.skill_registry.get_active_tools():
+            tools.append(tool)
+
+        for _, tool in self.mcp_registry.get_active_tools():
+            tools.append(tool)
+
+        if self.persistent_memory_service:
+            tools.extend(self.persistent_memory_service.get_tool_definitions())
+
+        if self.settings_service:
+            tools.extend(VOCABULARY_TOOLS)
+
+        if self.config.hud.info and HudService().available:
+            tools.extend(HUD_TOOLS)
+
+        return unique_tools(tools)
+
+    async def _show_on_hud(self, role: str, content, tool_calls) -> None:
+        await HudService().on_conversation_message(self, role, content, tool_calls)
+
+    # ───────────────── Backward-compat delegation ────────────── #
+
+    def get_command(self, command_name: str) -> CommandConfig | None:
+        """Backward-compat: delegate to command_executor."""
+        return self.command_executor.get_command(command_name)
+
+    async def execute_action(self, command: CommandConfig):
+        """Backward-compat: delegate to command_executor."""
+        await self.command_executor.execute_action(command)
+
+    # ───────────────── Threading ─────────────────────────────── #
+
+    def threaded_execution(self, function, *args) -> threading.Thread | None:
+        return threaded_execution(function, *args)
+
+    # ───────────────── Config management ─────────────────────── #
+
+    def _propagate_config(self, config: WingmanConfig) -> None:
+        """Push a config object to everything that captured a reference at
+        creation time. Assignments rebind, so holders of the previous config
+        object won't see new values without this."""
+        self.command_executor.config = config
+        self.conversation._config = config
+        self.condenser._config = config
+        self.context_builder._config = config
+        self.tool_executor._config = config
+        self.metrics.config = config
+        self.mcp_manager.config = config
+        self.skill_manager.config = config
+        # Provider adapters (ProviderFactory) also capture the config object —
+        # rebind so setting changes saved without revalidation (e.g. a new TTS
+        # voice) apply to live playback immediately.
+        for provider in (self.tts, self.llm):
+            if provider is not None and hasattr(provider, "_config"):
+                provider._config = config
+
+    async def update_config(
+        self, config: WingmanConfig, skip_config_validation: bool = True
+    ) -> bool:
+        try:
+            if not skip_config_validation:
+                old_config = deepcopy(self.config)
+
+            self.config = config
+            self._propagate_config(config)
+            self._learned_window = None
+
+            await self._update_skill_configs(config)
+            await self.skill_manager.apply_disabled_tools(config)
+
+            if not skip_config_validation:
+                errors = await self.validate()
+
+                for error in errors:
+                    if (
+                        error.error_type
+                        != WingmanInitializationErrorType.MISSING_SECRET
+                    ):
+                        # Roll back config on all services. validate() already
+                        # recreated the providers from the failed config, so
+                        # rebinding _config isn't enough — the adapter instances
+                        # themselves (e.g. a switched TTS provider) must be
+                        # rebuilt from the old config too.
+                        self.config = old_config
+                        self._propagate_config(old_config)
+                        await self.validate()
+                        return False
+
+            return True
+        except Exception as e:
+            await printr.print_async(
+                f"Error updating config for wingman '{self.name}': {str(e)}",
+                color=LogType.ERROR,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            return False
+
+    async def _update_skill_configs(self, wingman_config: WingmanConfig) -> None:
+        if not self.skills or not wingman_config.skills:
+            return
+
+        new_skill_configs: dict[str, "SkillConfig"] = {}
+        for skill_config in wingman_config.skills:
+            try:
+                folder_name = _get_skill_folder_from_module(skill_config.module)
+            except Exception:
+                printr.print(
+                    f"Skipping skill config override with unexpected module format: '{skill_config.module}'",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+                continue
+            new_skill_configs[folder_name] = skill_config
+
+        for skill in self.skills:
+            try:
+                skill_folder = _get_skill_folder_from_module(skill.config.module)
+            except Exception:
+                printr.print(
+                    f"Skipping loaded skill with unexpected module format: '{skill.config.module}'",
+                    color=LogType.WARNING,
+                    server_only=True,
+                )
+                continue
+
+            if skill_folder in new_skill_configs:
+                user_override = new_skill_configs[skill_folder]
+
+                fields_set = getattr(user_override, "model_fields_set", None)
+                if fields_set is None:
+                    fields_set = getattr(user_override, "__fields_set__", set())
+
+                updated_config = deepcopy(skill.config)
+
+                if "custom_properties" in fields_set:
+                    updated_config.custom_properties = user_override.custom_properties
+                if "prompt" in fields_set:
+                    updated_config.prompt = user_override.prompt
+
+                await skill.update_config(updated_config)
+
+    async def update_settings(self, settings: SettingsConfig):
+        try:
+            self.settings = settings
+
+            # Propagate to all services that hold a settings reference
+            self.conversation._settings = settings
+            self.context_builder._settings = settings
+            self.tool_executor._settings = settings
+            self.mcp_manager.settings = settings
+            self.skill_manager.settings = settings
+            self.decision_gate.update_settings(settings)
+
+            for skill in self.skills:
+                skill.settings = settings
+
+            # Re-create Wingman Pro provider when settings change
+            # (subscription settings might have been updated)
+            uses_wingman_pro = any([
+                self.config.features.conversation_provider == ConversationProvider.WINGMAN_PRO,
+                self.config.features.tts_provider == TtsProvider.WINGMAN_PRO,
+                self.config.features.image_generation_provider == ImageGenerationProvider.WINGMAN_PRO,
+            ])
+            if uses_wingman_pro:
+                await self.validate()
+                printr.print(
+                    f"Wingman {self.name}: reinitialized providers with new settings",
+                    server_only=True,
+                )
+
+            printr.print(f"Wingman {self.name}'s settings changed", server_only=True)
+        except Exception as e:
+            await printr.print_async(
+                f"Error while updating settings for wingman '{self.name}': {str(e)}",
+                color=LogType.ERROR,
+            )
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+
+    async def save_config(self):
+        self.tower.save_wingman(self.name)
+
+    async def save_commands(self):
+        self.tower.save_wingman_commands(self.name)

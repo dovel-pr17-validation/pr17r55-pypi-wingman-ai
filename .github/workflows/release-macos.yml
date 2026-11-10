@@ -1,0 +1,74 @@
+name: Build Core (macOS)
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: 'github'
+      channel:
+        description: "Update channel the build ships on: unstable or production. Decides which features Core offers (services/features.py) and where it is staged."
+        type: string
+        default: 'unstable'
+    outputs:
+      version:
+        description: "Extracted version from system_manager.py"
+        value: ${{ jobs.build-macos.outputs.version }}
+
+jobs:
+  build-macos:
+    name: Build macOS Executable
+    runs-on: ${{ inputs.runner == 'blacksmith' && 'blacksmith-6vcpu-macos-latest' || 'macos-latest' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Extract version from system_manager.py
+        id: version
+        shell: bash
+        run: |
+          version=$(grep -oE 'LOCAL_VERSION\s*=\s*"[^"]+"' services/system_manager.py | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $version"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11.7'
+
+      - name: Install system dependencies
+        run: brew install portaudio sdl2
+
+      - name: Create venv and install dependencies
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set build channel
+        run: python scripts/set_build_channel.py ${{ inputs.channel }}
+
+      - name: Build with PyInstaller
+        run: |
+          source venv/bin/activate
+          pyinstaller WingmanAiCore.spec --noconfirm
+
+      - name: Upload macOS Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-macos-aarch64
+          path: dist/WingmanAiCore/
+          retention-days: 5
+
+      - name: Upload to R2 staging
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          pip install awscli
+          bash .github/scripts/stage-core.sh "${{ inputs.channel }}" darwin-aarch64 dist/WingmanAiCore

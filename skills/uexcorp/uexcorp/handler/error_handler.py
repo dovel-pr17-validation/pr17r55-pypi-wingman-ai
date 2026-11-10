@@ -1,0 +1,52 @@
+import os
+import threading
+import time
+import traceback
+from os import path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from skills.uexcorp.uexcorp.helper import Helper
+
+
+class ErrorHandler:
+    def __init__(
+        self,
+        helper: "Helper",
+    ):
+        self.helper = helper
+        self.file = path.join(self.helper.get_data_path(), "error.log")
+
+    def get_error_file_path(self):
+        return self.file
+
+    def __get_error_header(self, function: str, arguments: list):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        header  = f"\n\n======================================"
+        header += f"\nTimestamp: {timestamp}"
+        header += f"\nSkill version: {self.helper.get_version_skill()}"
+        header += f"\nThread: {threading.current_thread().name}"
+        header += f"\nCalled function: {function}"
+        header += f"\nArguments: {arguments}"
+        header += f"\n======================================\n"
+        return header
+
+    # One old file is kept: the log never grows past about twice this size
+    MAX_SIZE = 5 * 1024 * 1024
+
+    def write(self, function: str, arguments: list|dict[str, any], error, write_traceback: bool = True):
+        try:
+            if os.path.getsize(self.file) > self.MAX_SIZE:
+                os.replace(self.file, self.file + ".1")
+        except OSError:
+            pass
+        with open(self.file, "a", encoding="utf-8") as f:
+            f.write(self.__get_error_header(function, arguments))
+            f.write(str(error))
+            if write_traceback:
+                f.write(traceback.format_exc())
+
+    def read(self):
+        with open(self.file, "r", encoding="utf-8") as f:
+            return f.read()
+        

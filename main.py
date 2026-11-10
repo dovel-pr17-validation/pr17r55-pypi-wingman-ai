@@ -1,0 +1,903 @@
+import multiprocessing
+import argparse
+import asyncio
+import atexit
+import faulthandler
+import logging
+import html
+from enum import Enum
+from os import path
+import os
+import platform
+import signal
+import sys
+import threading
+import traceback
+from typing import Any, Literal, get_args, get_origin
+
+# Must be called before anything else in a PyInstaller frozen app.
+# On macOS, multiprocessing spawns child processes by re-invoking the binary
+# with -c flags. Without this, argparse sees those flags and crashes.
+multiprocessing.freeze_support()
+
+# The macOS HUD keeps its windows in a process of its own, started from this
+# binary (hud_server/platform/macos.py). It needs none of Core.
+if len(sys.argv) > 1 and sys.argv[1] == "--hud-host":
+    from hud_server.platform.macos_host import main as _hud_host
+
+    sys.exit(_hud_host())
+
+# Diagnostics: dump a Python + all-thread traceback to stderr if the process
+# dies on a native fault (SIGSEGV/SIGABRT/SIGBUS/SIGFPE) from a C extension
+# (llama.cpp/Metal, onnxruntime, torch, PortAudio, SDL). Without this, such a
+# crash is silent and the only sign is a stray "leaked semaphore" warning from
+# the multiprocessing resource_tracker. Cheap and safe to leave enabled.
+faulthandler.enable()
+
+# =============================================================================
+# NVIDIA CUDA DLL PATH SETUP (must be done before any CUDA-dependent imports)
+# =============================================================================
+# When running as a PyInstaller bundle, the NVIDIA CUDA DLLs are in subdirectories
+# of _internal/nvidia/. We need to add these to PATH so onnxruntime can find them.
+# This must happen before any import that might load CUDA libraries.
+if getattr(sys, "frozen", False):
+    # Running as bundled exe
+    _internal_dir = sys._MEIPASS
+    # CUDA 13 puts every toolkit library in nvidia/cu13/bin/x86_64; cuDNN keeps
+    # nvidia/cudnn/bin. Parakeet also preloads them via onnxruntime.
+    _nvidia_paths = [
+        path.join(_internal_dir, "nvidia", "cu13", "bin", "x86_64"),
+        path.join(_internal_dir, "nvidia", "cudnn", "bin"),
+    ]
+    # Prepend existing paths that exist
+    _existing_nvidia_paths = [p for p in _nvidia_paths if path.isdir(p)]
+    if _existing_nvidia_paths:
+        os.environ["PATH"] = (
+            os.pathsep.join(_existing_nvidia_paths)
+            + os.pathsep
+            + os.environ.get("PATH", "")
+        )
+
+    # The PyInstaller bootloader put _internal in front of LD_LIBRARY_PATH and
+    # kept the old value in LD_LIBRARY_PATH_ORIG. The loader of this process
+    # read the variable at startup, so changing it now only affects programs
+    # Core starts: MCP servers, llama-server, xdg-open. Those must load the
+    # system's libraries, not our copies of libstdc++, OpenSSL or GLib.
+    if platform.system() == "Linux":
+        if "LD_LIBRARY_PATH_ORIG" in os.environ:
+            os.environ["LD_LIBRARY_PATH"] = os.environ.pop("LD_LIBRARY_PATH_ORIG")
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+
+    # The bundle names this script plain "main.py". To print a traceback,
+    # linecache then looks for a main.py along sys.path and finds a skill's
+    # main.py, so the source lines shown for Core's frames came from a skill.
+    # An entry without a modification time is never checked again: no source
+    # line under Core's frames, the line number stays.
+    import linecache
+
+    _entry_script = sys._getframe(0).f_code.co_filename
+    linecache.cache[_entry_script] = (0, None, [], _entry_script)
+
+# sounddevice loads PortAudio when it is imported. A Linux system without it
+# used to die on that import in wingman_core with a traceback the client never
+# showed; the user only saw "Backend startup timed out". Say what is missing.
+if platform.system() == "Linux":
+    try:
+        import sounddevice  # noqa: F401
+    except OSError as portaudio_error:
+        from api.enums import LogType
+        from services.printr import Printr
+
+        Printr().print(
+            f"PortAudio is missing ({portaudio_error}). Wingman needs it for the "
+            "microphone and for speech output. Install it with your package manager "
+            "and start Wingman again: 'sudo dnf install portaudio' (Fedora), "
+            "'sudo apt install libportaudio2' (Ubuntu, Debian), "
+            "'sudo pacman -S portaudio' (Arch).",
+            color=LogType.ERROR,
+            server_only=True,
+        )
+        sys.exit(1)
+
+# Before the first event loop exists: every loop after this one survives a
+# socket read another thread cancelled (Windows, see services/event_loop.py).
+from services import event_loop
+
+event_loop.install()
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.concurrency import asynccontextmanager
+from fastapi.routing import APIRoute
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from starlette.websockets import WebSocketState
+from api.commands import McpOAuthStateChangedCommand, WebSocketCommandModel
+from api.interface import BenchmarkResult, CoreStatusResponse, MachineHash
+from api.enums import ENUM_TYPES, CoreState, LogType, WingmanInitializationErrorType
+import keyboard.keyboard as keyboard
+from services.command_handler import CommandHandler
+from services.config_manager import ConfigManager, ConfigValidationError
+from services.connection_manager import ConnectionManager
+from services.esp32_handler import Esp32Handler
+from services import error_reporting
+from services.avatar_studio import variant_file
+from services.file import get_generated_images_dir
+from services.secret_keeper import SecretKeeper
+from services.printr import Printr
+from services.websocket_user import WebSocketUser
+from services.mcp_oauth import CALLBACK_PATH, get_oauth_service
+from services.system_manager import LOCAL_VERSION, SystemManager
+from wingman_core import WingmanCore
+port = None
+host = None
+
+connection_manager = ConnectionManager()
+
+
+printr = Printr()
+Printr.set_connection_manager(connection_manager)
+
+# Before the config is loaded, so a crash in the migration is reported too.
+# Sends nothing until the user has agreed in the client.
+error_reporting.init()
+
+app_is_bundled = getattr(sys, "frozen", False)
+app_root_path = sys._MEIPASS if app_is_bundled else path.dirname(path.abspath(__file__))
+
+# Set the bundled skills directory for ModuleManager
+from services.module_manager import set_bundled_skills_dir
+from services.wingman_default_voices import apply_default_voices
+from services import other_language
+
+bundled_skills_path = path.join(app_root_path, "skills")
+set_bundled_skills_dir(bundled_skills_path)
+printr.print(
+    f"Skills directory: {bundled_skills_path}",
+    server_only=True,
+    color=LogType.STARTUP,
+)
+
+# creates all the configs from templates - do this first!
+config_manager = ConfigManager(app_root_path)
+printr.print(
+    f"Config directory: {config_manager.config_dir}",
+    server_only=True,
+    color=LogType.STARTUP,
+)
+
+secret_keeper = SecretKeeper()
+SecretKeeper.set_connection_manager(connection_manager)
+
+system_manager = SystemManager()
+printr.print(
+    f"Wingman AI Core v{LOCAL_VERSION}",
+    server_only=True,
+    color=LogType.STARTUP,
+)
+
+# uses the Singletons above, so don't move this up!
+core = WingmanCore(
+    config_manager=config_manager,
+    app_root_path=app_root_path,
+    app_is_bundled=app_is_bundled,
+    system_manager=system_manager,
+)
+core.set_connection_manager(connection_manager)
+
+
+def _error_report_tags() -> dict:
+    settings = config_manager.settings_config
+    return {
+        "stt_provider": getattr(settings.stt.provider, "value", None),
+        "voice_activation": settings.voice_activation.enabled,
+        "plan": core.client_plan,
+    }
+
+
+error_reporting.set_tag_provider(_error_report_tags)
+
+keyboard.hook(core.on_key)
+
+def custom_generate_unique_id(route: APIRoute):
+    return f"{route.tags[0]}-{route.name}"
+
+
+def modify_openapi():
+    """Strip the tagname of the functions (for the client) in the OpenAPI spec"""
+    openapi_schema = app.openapi()
+    for path_data in openapi_schema["paths"].values():
+        for operation in path_data.values():
+            tags = operation.get("tags")
+            if tags:
+                tag = tags[0]
+                operation_id = operation.get("operationId")
+                if operation_id:
+                    to_remove = f"{tag}-"
+                    new_operation_id = operation_id[len(to_remove) :]
+                    operation["operationId"] = new_operation_id
+    app.openapi_schema = openapi_schema
+
+
+async def shutdown():
+    await connection_manager.shutdown()
+    await core.shutdown()
+    keyboard.unhook_all()
+
+
+def exit_process(code: int):
+    """End the process now. os._exit skips the atexit handlers, so they run
+    here first: exit_handler and the ones that stop llama-server and unhook
+    keyboard and mouse. They get ten seconds; they must not keep the process
+    alive in turn."""
+    cleanup = threading.Thread(target=atexit._run_exitfuncs, daemon=True)
+    cleanup.start()
+    cleanup.join(timeout=10)
+    logging.shutdown()
+    os._exit(code)
+
+
+def exit_handler():
+    printr.print(
+        "atexit handler shutting down...", color=LogType.SYSTEM, server_only=True
+    )
+    try:
+        asyncio.run(shutdown())
+    except Exception:
+        # If async shutdown fails (e.g. loop issues), the LlamaCppProvider's
+        # own atexit handler will still kill orphan llama-server processes.
+        pass
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # executed before the application starts
+    # WebSocket sends from worker threads have to be routed back to this loop
+    WebSocketUser.set_main_loop(asyncio.get_running_loop())
+    connection_manager.set_main_loop(asyncio.get_running_loop())
+    error_reporting.watch_event_loop(asyncio.get_running_loop())
+    modify_openapi()
+
+    yield
+
+    # executed after the application has finished
+    printr.print(
+        "Lifespan end - shutting down...", color=LogType.SYSTEM, server_only=True
+    )
+    await shutdown()
+
+
+app = FastAPI(lifespan=lifespan, generate_unique_id_function=custom_generate_unique_id)
+
+
+def custom_openapi():
+    global host
+
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="Wingman AI Core REST API",
+        version=LOCAL_VERSION,
+        description="Communicate with Wingman AI Core",
+        routes=app.routes,
+    )
+
+    # Add custom server configuration
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = f"http://{host}"
+    openapi_schema["servers"] = [{"url": f"{host}:{port}"}]
+
+    # Ensure the components.schemas key exists
+    openapi_schema.setdefault("components", {}).setdefault("schemas", {})
+
+    # Add enums to schema
+    for enum_name, enum_model in ENUM_TYPES.items():
+        enum_field_name, enum_type = next(iter(enum_model.__annotations__.items()))
+        if issubclass(enum_type, Enum):
+            enum_values = [e.value for e in enum_type]
+            enum_schema = {
+                "type": "string",
+                "enum": enum_values,
+                "description": f"Possible values for {enum_name}",
+            }
+            openapi_schema["components"]["schemas"][enum_name] = enum_schema
+
+    openapi_schema["components"]["schemas"]["CommandActionConfig"] = {
+        "type": "object",
+        "properties": {
+            "keyboard": {"$ref": "#/components/schemas/CommandKeyboardConfig"},
+            "wait": {"type": "number"},
+            "mouse": {"$ref": "#/components/schemas/CommandMouseConfig"},
+            "write": {"type": "string"},
+            "audio": {"$ref": "#/components/schemas/AudioFileConfig"},
+            "joystick": {"$ref": "#/components/schemas/CommandJoystickConfig"},
+        },
+    }
+
+    # Add WebSocket command models to schema
+    for cls in WebSocketCommandModel.__subclasses__():
+        cls_schema_dict = cls.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+
+        for field_name, field_type in cls.__annotations__.items():
+            origin = get_origin(field_type)
+            if origin is Literal:
+                literal_args = get_args(field_type)
+                if len(literal_args) == 1:
+                    literal_value = literal_args[0]
+                    cls_schema_dict["properties"][field_name] = {
+                        "type": "string",
+                        "enum": [literal_value],
+                    }
+                else:
+                    cls_schema_dict["properties"][field_name] = {
+                        "type": "string",
+                        "enum": list(literal_args),
+                    }
+
+                cls_schema_dict.setdefault("required", []).append(field_name)
+        # Models a command nests (TokenUsage in LogCommand) arrive as $defs.
+        # The refs already point at components/schemas, so they have to live
+        # there; a model only ever used by a command is in no REST route and
+        # would otherwise be a dangling ref that breaks the client generator.
+        schemas = openapi_schema["components"]["schemas"]
+        for def_name, def_schema in cls_schema_dict.pop("$defs", {}).items():
+            schemas.setdefault(def_name, def_schema)
+        schemas[cls.__name__] = cls_schema_dict
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# if a class adds GET/POST endpoints, add them here:
+app.include_router(core.router)
+app.include_router(core.config_service.router)
+app.include_router(core.settings_service.router)
+app.include_router(core.hud_service.router)
+app.include_router(core.voice_service.router)
+
+app.include_router(system_manager.router)
+app.include_router(secret_keeper.router)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await connection_manager.connect(websocket)
+    command_handler = CommandHandler(connection_manager, core)
+    try:
+        while True:
+            message = await websocket.receive_text()
+            await command_handler.dispatch(message, websocket)
+    except WebSocketDisconnect:
+        await printr.print_async("Client disconnected", server_only=True)
+    except RuntimeError:
+        # The connection manager closed the socket (a failed send): the
+        # client is gone, the same as a disconnect.
+        if websocket.application_state == WebSocketState.CONNECTED:
+            raise
+        await printr.print_async("Client disconnected", server_only=True)
+    finally:
+        await connection_manager.disconnect(websocket)
+
+
+# Websocket for ESP32 clients to stream audio to and from
+@app.websocket("/")
+async def oi_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    esp32_handler = Esp32Handler(core)
+    receive_task = asyncio.create_task(esp32_handler.receive_messages(websocket))
+    send_task = asyncio.create_task(esp32_handler.send_messages(websocket))
+    try:
+        await asyncio.gather(receive_task, send_task)
+    except Exception as e:
+        print(traceback.format_exc())
+        print(f"Connection lost. Error: {e}")
+
+
+@app.websocket("/ws/audio")
+async def websocket_global_audio_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    printr.print(
+        f"Audio client {websocket.client.host} connected",
+        server_only=True,
+        color=LogType.SYSTEM,
+    )
+
+    # Track connection state
+    is_connected = True
+
+    # Reference to the callback function for cleanup
+    audio_callback = None
+
+    try:
+        # Wait for the audio player to be ready
+        retry_count = 0
+        max_retries = 5
+
+        while retry_count < max_retries and is_connected:
+            # Check if audio_player is ready
+            if (
+                core.audio_player
+                and hasattr(core.audio_player, "stream_event")
+                and core.audio_player.stream_event is not None
+            ):
+                try:
+                    # Define handler for audio chunks
+                    async def on_audio_chunk(data: bytes):
+                        nonlocal is_connected
+
+                        if not is_connected:
+                            return
+
+                        try:
+                            # Forward the audio chunk to the browser client
+                            await websocket.send_bytes(data)
+                        except Exception as e:
+                            printr.print(
+                                f"Error sending audio: {str(e)}",
+                                server_only=True,
+                                color=LogType.ERROR,
+                            )
+                            is_connected = False
+
+                    # Save reference to the callback for later cleanup
+                    audio_callback = on_audio_chunk
+
+                    # Subscribe without expecting a return value
+                    core.audio_player.stream_event.subscribe("audio", audio_callback)
+                    printr.print(
+                        "Audio subscription successful",
+                        server_only=True,
+                        color=LogType.SYSTEM,
+                    )
+                    break
+
+                except Exception as e:
+                    printr.print(
+                        f"Error subscribing to audio: {str(e)}",
+                        server_only=True,
+                        color=LogType.WARNING,
+                    )
+
+            # Not ready or subscription failed, wait and retry
+            retry_count += 1
+            if retry_count < max_retries:
+                await asyncio.sleep(1)
+            else:
+                printr.print(
+                    "Audio player not ready after multiple attempts",
+                    server_only=True,
+                    color=LogType.WARNING,
+                )
+                await websocket.close(code=1013)
+                return
+
+        # Keep connection open until client disconnects
+        while is_connected:
+            try:
+                await websocket.receive_text()
+            except:
+                is_connected = False
+                break
+
+    except WebSocketDisconnect:
+        printr.print(
+            f"Audio client disconnected", server_only=True, color=LogType.SYSTEM
+        )
+    except Exception as e:
+        printr.print(f"Audio error: {str(e)}", server_only=True, color=LogType.ERROR)
+    finally:
+        # Clean up subscription using the audio_callback reference
+        if (
+            audio_callback is not None
+            and core.audio_player
+            and hasattr(core.audio_player, "stream_event")
+            and core.audio_player.stream_event is not None
+        ):
+            try:
+                core.audio_player.stream_event.unsubscribe("audio", audio_callback)
+                printr.print(
+                    "Audio unsubscribed successfully",
+                    server_only=True,
+                    color=LogType.SYSTEM,
+                )
+            except Exception as e:
+                printr.print(
+                    f"Error unsubscribing from audio: {str(e)}",
+                    server_only=True,
+                    color=LogType.ERROR,
+                )
+
+
+@app.post("/start-secrets", tags=["main"])
+async def start_secrets(secrets: dict[str, Any]):
+    await secret_keeper.post_secrets(secrets)
+    core.startup_errors = []
+    await core.config_service.load_config()
+
+
+_exit_task: asyncio.Task | None = None
+
+
+@app.post("/shutdown", tags=["main"], include_in_schema=False)
+async def shutdown_and_exit(request: Request):
+    """Shut Core down cleanly and end the process.
+
+    The client calls this before it installs an update and restarts. Killing
+    Core instead leaves llama-server, Pocket TTS and xVASynth running: they hold
+    their ports and GPU memory against the Core that starts next, and on Windows
+    the installer cannot replace their files. Core listens on every interface
+    as a sidecar, so only the machine it runs on may ask.
+    """
+    global _exit_task
+    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403)
+
+    async def _shutdown_then_exit():
+        # Let the response go out before the server goes away.
+        await asyncio.sleep(0.2)
+        printr.print(
+            "Shutdown requested by the client.", color=LogType.SYSTEM, server_only=True
+        )
+        try:
+            await shutdown()
+        finally:
+            logging.shutdown()
+            # The atexit handler would run shutdown() a second time.
+            os._exit(0)
+
+    if _exit_task is None:
+        _exit_task = asyncio.create_task(_shutdown_then_exit())
+
+
+@app.get("/ping", tags=["main"], response_model=CoreStatusResponse)
+async def ping():
+    return core.get_status()
+
+
+@app.get(CALLBACK_PATH, tags=["main"], include_in_schema=False)
+async def mcp_oauth_callback(
+    code: str | None = None, state: str | None = None, error: str | None = None
+):
+    """Where an MCP authorization server sends the user's browser back.
+
+    This is a loopback redirect, the same one every native MCP client uses. It
+    has to live on the app itself rather than on a router, because the path is
+    baked into the redirect URI that was registered with the provider.
+
+    It is kept out of the OpenAPI schema on purpose: it is not part of the API
+    the client calls, and generating a method for it would only invite someone
+    to call it.
+    """
+    accepted, message = await get_oauth_service().handle_callback(code, state, error)
+    return HTMLResponse(
+        content=_callback_page(accepted, message),
+        status_code=200 if accepted else 400,
+    )
+
+
+def _callback_page(accepted: bool, message: str) -> str:
+    """The page the user lands on after consenting.
+
+    Deliberately one self-contained file with no requests of its own: it is
+    served by Core to an ordinary browser that has no access to the app's assets,
+    and it is the last thing standing between a user and a working MCP server.
+    """
+    title = "Wingman AI is connected" if accepted else "Authorization failed"
+    accent = "#4ade80" if accepted else "#f87171"
+    # The message is whatever the authorization server put in `error`, or its
+    # token-endpoint error text. Anyone who can make a browser open this URL
+    # controls it, and a script running on Core's origin can read /secrets.
+    message = html.escape(message)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ margin:0; min-height:100vh; display:flex; align-items:center;
+         justify-content:center; background:#0f1115; color:#e6e8ee;
+         font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }}
+  main {{ max-width:26rem; padding:2.5rem; text-align:center; }}
+  h1 {{ font-size:1.25rem; margin:0 0 .75rem; color:{accent}; }}
+  p {{ margin:0; line-height:1.6; color:#a8adbd; }}
+</style></head>
+<body><main>
+  <h1>{title}</h1>
+  <p>{message}</p>
+  <p style="margin-top:1rem">You can close this tab and go back to Wingman AI.</p>
+</main></body></html>"""
+
+
+@app.get("/generated-images/{filename}", tags=["main"], include_in_schema=False)
+async def get_generated_image(filename: str):
+    """Serve one image the Image Generation skill produced.
+
+    The client renders these with a plain <img src>, so they travel over HTTP
+    instead of through the WebSocket - a generated image as a base64 data URL is
+    several megabytes and used to stall the socket for every other message.
+
+    Kept out of the OpenAPI schema: the client builds the URL from the path Core
+    broadcasts, there is no generated method to call.
+    """
+    images_dir = path.realpath(get_generated_images_dir())
+    # No traversal: the name must be a plain file directly inside the directory.
+    if path.basename(filename) != filename:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    file_path = path.realpath(path.join(images_dir, filename))
+    if path.commonpath([images_dir, file_path]) != images_dir or not path.isfile(
+        file_path
+    ):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(file_path)
+
+
+@app.get(
+    "/avatar-images/{wingman_name}/{filename}", tags=["main"], include_in_schema=False
+)
+async def get_avatar_image(wingman_name: str, filename: str):
+    """Serve one avatar studio variant. Same reason as /generated-images: the
+    client renders it with a plain <img src> and draws it onto a canvas."""
+    file_path = variant_file(wingman_name, filename)
+    if not file_path:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(file_path)
+
+
+_machine_hash: str | None = None
+
+
+@app.get("/system/machine-hash", tags=["main"], response_model=MachineHash)
+async def get_machine_hash():
+    """An anonymous, stable id of this machine for the backend's referral
+    checks. Only the salted hash, never the machine id itself."""
+    global _machine_hash
+    if _machine_hash is None:
+        from services.machine_hash import machine_hash
+
+        _machine_hash = await asyncio.to_thread(machine_hash)
+    return MachineHash(machine_hash=_machine_hash)
+
+
+@app.get("/client/plan", tags=["main"], response_model=str)
+async def get_client_plan():
+    return core.client_plan
+
+
+@app.get("/client/account-name", tags=["main"], response_model=str)
+async def get_client_account_name():
+    return core.client_account_name
+
+
+# required to generate API specs for class BenchmarkResult that is only used internally
+@app.get("/dummy-benchmark", tags=["main"], response_model=BenchmarkResult)
+async def get_dummy_benchmark():
+    return BenchmarkResult(
+        label="Sample Benchmark",
+        execution_time_ms=150.0,
+        formatted_execution_time=0.15,
+        snapshots=[
+            BenchmarkResult(
+                label="Sub Benchmark",
+                execution_time_ms=75.0,
+                formatted_execution_time=0.075,
+            )
+        ],
+    )
+
+
+async def async_main(host: str, port: int, sidecar: bool):
+    # The OAuth redirect URI points at this process, so the service cannot know
+    # it until the port is known. Do it before uvicorn binds: a user cannot reach
+    # the settings UI before the server is up, but the redirect URI is read the
+    # moment anyone asks for a server's OAuth status.
+    oauth_service = get_oauth_service()
+    oauth_service.set_callback_origin(host, port)
+    async def on_oauth_state_changed(mcp_name: str, is_authorized: bool, error):
+        # Reconnect before telling the client: it reloads the server list on
+        # this command, and the list has to show the server connected, not the
+        # "needs authorization" error from boot next to an "Authorized" badge.
+        if is_authorized:
+            try:
+                await core.config_service.reconnect_wingmen_using_mcp(mcp_name)
+            except Exception as e:
+                printr.print(
+                    f"Could not reconnect wingmen after authorizing '{mcp_name}': {e}",
+                    color=LogType.ERROR,
+                    server_only=True,
+                )
+        await connection_manager.broadcast(
+            McpOAuthStateChangedCommand(
+                mcp_name=mcp_name, is_authorized=is_authorized, error=error
+            )
+        )
+
+    oauth_service.set_state_changed_handler(on_oauth_state_changed)
+
+    # Start uvicorn FIRST so Client can connect and see progress updates
+    try:
+        uvi_config = uvicorn.Config(app=app, host=host, port=port, lifespan="on")
+        server = uvicorn.Server(uvi_config)
+        server_task = asyncio.create_task(server.serve())
+
+        # Wait for server to bind the port
+        while not server.started:
+            await asyncio.sleep(0.05)
+
+        printr.print(
+            f"Server listening on {host}:{port}",
+            color=LogType.STARTUP,
+            server_only=True,
+        )
+    except Exception as e:
+        printr.print(f"Error starting uvicorn server: {str(e)}", color=LogType.ERROR)
+        printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+        return
+
+    try:
+        # Set MIGRATING state before migrations
+        await core.set_core_state(CoreState.MIGRATING, message="Migrating configurations...")
+        await core.config_service.migrate_configs(system_manager)
+
+        # Dutch set as another language before Wingman spoke it: now it does.
+        promoted = other_language.promote_to_supported(core.config_manager)
+        if promoted:
+            printr.print(f"Spoken language is now {promoted}.", server_only=True)
+
+        # Shipped Wingmen still on a default voice get the one recorded in
+        # the spoken language (also on the first start and after an update).
+        apply_default_voices(
+            core.config_manager,
+            core.app_root_path,
+            core.settings_service.settings.spoken_language.value,
+        )
+
+        # Set LOADING_CONFIG state
+        await core.set_core_state(CoreState.LOADING_CONFIG, message="Loading configuration...")
+        await core.config_service.load_config()
+
+        saved_secrets: list[str] = []
+        for error in core.tower_errors:
+            if (
+                not sidecar  # running standalone
+                and error.error_type == WingmanInitializationErrorType.MISSING_SECRET
+                and not error.secret_name in saved_secrets
+            ):
+                secret = input(f"Please enter your '{error.secret_name}' API key/secret: ")
+                if secret:
+                    secret_keeper.secrets[error.secret_name] = secret
+                    await secret_keeper.save()
+                    saved_secrets.append(error.secret_name)
+                else:
+                    return
+            else:
+                core.startup_errors.append(error)
+
+        try:
+            await core.startup()
+            event_loop = asyncio.get_running_loop()
+            core.audio_player.set_event_loop(event_loop)
+            asyncio.create_task(core.process_events())
+            # Set READY state - this also sets is_started = True
+            await core.set_core_state(CoreState.READY)
+
+            # Check for keyboard hook errors (delayed to give macOS thread time to start)
+            await asyncio.sleep(1)
+            kb_error = keyboard.get_init_error()
+            if kb_error:
+                if platform.system() == "Linux":
+                    msg = (
+                        "Push-to-talk unavailable: keyboard access denied.\n"
+                        "Run this command, then log out and back in:\n"
+                        "sudo usermod -a -G input $USER"
+                    )
+                elif platform.system() == "Darwin":
+                    msg = (
+                        "Push-to-talk unavailable: Accessibility permissions not granted.\n"
+                        "Grant access in System Settings > Privacy & Security > Accessibility, "
+                        "then restart Wingman AI."
+                    )
+                else:
+                    msg = f"Push-to-talk unavailable: {kb_error}"
+                printr.toast_warning(msg)
+        except Exception as e:
+            printr.print(f"Error starting Wingman AI Core: {str(e)}", color=LogType.ERROR)
+            printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+            return
+
+        # Keep process alive via the server task
+        await server_task
+    finally:
+        server.should_exit = True
+        await server_task
+
+
+if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(description="Run the FastAPI server.")
+    parser.add_argument(
+        "-H",
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host for the FastAPI server to listen on.",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=str,
+        default="49111",
+        help="Port for the FastAPI server to listen on.",
+    )
+    parser.add_argument(
+        "--sidecar",
+        action="store_true",
+        help="Whether or not Wingman AI Core was launched from a client (as sidecar).",
+    )
+    args = parser.parse_args()
+
+    host = args.host
+    port = int(args.port)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # No running event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    atexit.register(exit_handler)
+    stopping = False
+
+    def signal_handler(sig, frame):
+        global stopping
+        stopping = True
+        printr.print(
+            "SIGINT/SIGTERM received! Initiating shutdown...",
+            color=LogType.SYSTEM,
+            server_only=True,
+        )
+
+        async def _shutdown_then_stop():
+            await shutdown()
+            loop.stop()
+
+        # Let shutdown complete before stopping the loop
+        asyncio.ensure_future(_shutdown_then_stop())
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        loop.run_until_complete(async_main(host=host, port=port, sidecar=args.sidecar))
+    except ConfigValidationError:
+        # The error message was already formatted and displayed by the config service
+        # (toast_error). Just record the traceback in the log file silently so the
+        # terminal shows only the clean, user-friendly message.
+        printr.logger.info(f"Config validation failed at startup:\n{traceback.format_exc()}")
+    except Exception as e:
+        printr.print(f"Error starting application: {str(e)}", color=LogType.ERROR)
+        printr.print(traceback.format_exc(), color=LogType.ERROR, server_only=True)
+        if not stopping:
+            # The loop is gone, but the threads of turns, skills and audio
+            # keep the process alive: Core would still run and answer nothing.
+            # End it so the client shows that Core stopped.
+            exit_process(1)
+
+    # Stopped by Ctrl+C or SIGTERM, or the loop ended. AnyIO's worker threads
+    # are no daemons and only end with the task that started them, which
+    # loop.stop() cuts short: Python would wait for them forever on exit.
+    exit_process(0)
